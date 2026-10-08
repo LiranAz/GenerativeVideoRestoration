@@ -114,6 +114,8 @@ class VideoRealESRGANDataset(RealESRGANDataset):
         num_frames:    T, frames per clip
         frame_stride:  [min, max] temporal stride, sampled uniformly per clip
         reverse_prob:  probability of playing the clip backwards
+        gt_size:       spatial crop (HR pixels), identical for all frames of a clip
+        crop_type:     'random' (default) or 'center'
     """
 
     def __init__(self, opt):
@@ -128,7 +130,9 @@ class VideoRealESRGANDataset(RealESRGANDataset):
         self.num_frames = opt['num_frames']
         self.frame_stride = opt.get('frame_stride', [1, 1])
         self.reverse_prob = opt.get('reverse_prob', 0.0)
-        self.gt_size = opt['gt_size']
+        self.gt_size = int(opt['gt_size'])
+        self.crop_type = opt.get('crop_type', 'random')
+        assert self.crop_type in ('random', 'center'), f"crop_type must be 'random' or 'center', got {self.crop_type}"
 
     def _sample_indices(self, n):
         T = self.num_frames
@@ -190,8 +194,11 @@ class VideoRealESRGANDataset(RealESRGANDataset):
             new_size = (math.ceil(w * ratio), math.ceil(h * ratio))
             frames = [cv2.resize(f, new_size, interpolation=cv2.INTER_CUBIC).clip(0, 1) for f in frames]
             h, w = frames[0].shape[:2]
-        top = random.randint(0, h - self.gt_size)
-        left = random.randint(0, w - self.gt_size)
+        if self.crop_type == 'center':
+            top, left = (h - self.gt_size) // 2, (w - self.gt_size) // 2
+        else:
+            top = random.randint(0, h - self.gt_size)
+            left = random.randint(0, w - self.gt_size)
         frames = [f[top:top + self.gt_size, left:left + self.gt_size] for f in frames]
         if self.opt.get('use_hflip', True) and random.random() < 0.5:
             frames = [f[:, ::-1] for f in frames]

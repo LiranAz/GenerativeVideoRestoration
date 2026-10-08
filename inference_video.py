@@ -3,6 +3,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from sampler_video import VideoSampler
+from utils.util_crop import resolve_crop, lq_multiple
 from utils.util_opts import str2bool
 
 
@@ -28,13 +29,14 @@ def get_parser():
 def main():
     args = get_parser()
     configs = OmegaConf.load(args.config_path)
+    resolve_crop(configs)       # same crop-dependent values as in training (model image_size, patch size)
     configs.model.ckpt_path = str(args.ckpt_path)
     configs.diffusion.params.sf = args.scale
     sampler = VideoSampler(
             configs, sf=args.scale, use_amp=not args.fp32,
             chop_size=args.chop_size, chop_stride=args.chop_stride,
             num_frames=args.num_frames, frame_overlap=args.frame_overlap,
-            padding_offset=max(configs.model.params.get('lq_size', 64), 64), seed=args.seed,
+            padding_offset=lq_multiple(configs), seed=args.seed,
             patch_restoration=args.patch_restoration,
             )
     sampler.inference(args.in_path, args.out_path, save_frames=args.save_frames)

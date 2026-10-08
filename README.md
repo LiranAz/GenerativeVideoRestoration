@@ -37,7 +37,7 @@ Details:
   | output | `[B, 3, T, H, W]` |
 
   `H` and `W` must be multiples of `patch_size × 8 × window_size` (256 for real-world SR, 512 for faces); pad otherwise.
-  Training crops are 256×256 (`gt_size`); the UNet is built for `image_size=64`, so smaller crops are not supported.
+  The training crop is configurable (`degradation.gt_size`, default 256; see below).
 - Full change log and licence note: [`UPSTREAM.md`](UPSTREAM.md).
 
 ## Installation
@@ -72,6 +72,17 @@ data:
       lq_path: /path/to/val_videos/lq        # optional validation set
       gt_path: /path/to/val_videos/gt        # same video names as in lq_path
 ```
+
+**Crop size.** The training crop is one config value, `degradation.gt_size` (HR pixels, default 256). Everything that depends
+on it is derived or checked by `utils/util_crop.py` at start-up (`main.py`, `TrainerDifVSR`, `inference_video.py`):
+`model.params.image_size` (`~` = auto, `gt_size / patch_size`), the dataset crop (`data.train.params.gt_size:
+${degradation.gt_size}`), `patch_restoration.patch_size` (`~` = the crop) and the validation/inference LQ multiple
+(`train.val_resolution: ~`). The crop must be a multiple of `patch_size * 2^(levels-1)` and every UNet level must be a
+multiple of `window_size` (or not larger than it), otherwise you get an explanatory error: with the default model,
+multiples of 256 always work, and e.g. 128 works too. `crop_type: random|center` selects where the crop is taken;
+`num_frames` and `frame_stride` control the temporal crop. If you change the crop, also check
+`model.params.attention_resolutions` (the resolutions of the folded UNet levels, i.e. `gt_size / patch_size / 2^k`;
+a warning is raised if none matches), and note that a checkpoint is only valid for the crop it was trained with.
 
 Training clips are cropped to `gt_size` and flipped identically for all frames. The Real-ESRGAN degradation is applied on
 the GPU with **one set of blur kernels and one JPEG quality per clip**; resize factors and noise type are shared by the
@@ -150,6 +161,7 @@ match this architecture; pass your own trained checkpoint instead.
 ## Repository layout
 
 ```
+utils/util_crop.py          crop-size resolution/validation (single source: degradation.gt_size)
 models/unet.py              DiTSRModel (5-D input, pixel-unshuffle stem)
 models/swin_transformer.py  adaLN-Zero Swin block + TemporalAttention
 models/gaussian_diffusion.py  ResShift-style diffusion (pixel space, video-aware)

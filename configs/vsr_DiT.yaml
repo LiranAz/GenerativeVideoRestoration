@@ -5,7 +5,7 @@ model:
   target: models.unet.DiTSRModel
   ckpt_path: ~
   params:
-    image_size: 64   # resolution the UNet works at, i.e. pixel size / patch_size
+    image_size: ~    # ~ = auto: degradation.gt_size / patch_size (see utils/util_crop.py)
     patch_size: 4    # pixel-unshuffle factor: pixel-space input is folded to image_size x image_size before the UNet
     in_channels: 3
     model_channels: 128
@@ -22,7 +22,6 @@ model:
     window_size: 8
     mlp_ratio: 4
     cond_lq: True
-    lq_size: 64
 
 diffusion:
   target: models.script_util.create_gaussian_diffusion
@@ -49,7 +48,7 @@ diffusion:
 # Used by inference_video.py (override with --patch_restoration true/false) and by validation.
 patch_restoration:
   enabled: False
-  patch_size: 256        # HR pixels; must equal the training crop (degradation.gt_size)
+  patch_size: ~          # HR pixels; ~ = the training crop (degradation.gt_size)
   patch_stride: 128      # HR pixels; patch_size // 2 -> 4x the cost of non-overlapping patches
   patch_frames: ~        # temporal patch length; ~ (null) -> all frames of the clip
   frame_stride: ~        # temporal stride; ~ -> patch_frames // 2
@@ -79,7 +78,9 @@ degradation:
   jpeg_range2: [30, 95]
 
   queue_size: 64          # training-pair pool (clips); must be divisible by the batch size
-  gt_size: 256
+  gt_size: 256            # TRAINING CROP in HR pixels. Change it here only: model image_size, the dataset crop and
+                          # patch_restoration.patch_size follow. Must be a multiple of patch_size * 2^(levels-1);
+                          # with the default model (4 * 8 * window 8) multiples of 256 are always valid. util_crop.py checks it.
   resize_back: False
   use_sharp: False
 
@@ -112,7 +113,8 @@ data:
 
       final_sinc_prob: 0.8
 
-      gt_size: 256
+      gt_size: ${degradation.gt_size}   # keep in sync with the crop
+      crop_type: random       # random | center
       crop_pad_size: 300
       use_hflip: True
       use_rot: False
@@ -150,7 +152,7 @@ train:
   use_ema_val: True            
   val_freq: ${train.save_freq}
   val_y_channel: True
-  val_resolution: ${model.params.lq_size}
+  val_resolution: ~             # LQ pixels; ~ = smallest size the UNet accepts (utils.util_crop.lq_multiple)
   val_padding_mode: reflect
   # training setting
   use_amp: True                # amp training

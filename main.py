@@ -40,5 +40,8 @@ if __name__ == "__main__":
         if key in ['cfg_path', 'save_dir', 'resume', ]:
             configs[key] = getattr(args, key)
 
+    from utils.util_crop import resolve_crop
+    resolve_crop(configs)    # crop-dependent values (model image_size, ...); no-op for configs without degradation.gt_size
+
     trainer = get_obj_from_str(configs.trainer.target)(configs)
     trainer.train()

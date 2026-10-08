@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sampler import BaseSampler
+from utils.util_crop import check_hr_size
 from patch_restoration import get_patch_cfg, PatchDiffusiveRestoration
 from datapipe.video_datasets import VideoReader, find_videos, is_video_file, IMG_EXTS
 
@@ -67,10 +68,7 @@ class VideoSampler(BaseSampler):
             self.patch_restorer = PatchDiffusiveRestoration(self.base_diffusion, self.model, self.patch_cfg, sf=sf)
 
     def _check_patch_cfg(self):
-        mp = self.configs.model.params
-        unit = mp.get('patch_size', 1) * 2 ** (len(mp.channel_mult) - 1) * mp.window_size
-        p = self.patch_cfg['patch_size']
-        assert p % unit == 0, f'patch_restoration.patch_size ({p}) must be a multiple of {unit} for this model'
+        check_hr_size(self.configs, self.patch_cfg['patch_size'], 'patch_restoration.patch_size')
 
     # ------------------------------------------------------------------ noise
     def _frame_noise(self, frame_idx, height, width, device):

@@ -14,9 +14,14 @@ from einops import rearrange
 from trainer import TrainerDifIR
 from utils import util_image
 from patch_restoration import get_patch_cfg, wrap_model
+from utils.util_crop import resolve_crop, lq_multiple
 
 
 class TrainerDifVSR(TrainerDifIR):
+    def __init__(self, configs):
+        resolve_crop(configs)    # derive/validate everything that depends on degradation.gt_size
+        super().__init__(configs)
+
     # ------------------------------------------------------------------ data
     @torch.no_grad()
     def _dequeue_and_enqueue(self):
@@ -67,7 +72,7 @@ class TrainerDifVSR(TrainerDifIR):
             return {'lq': self.lq.contiguous(), 'gt': self.gt}
         elif phase == 'val':
             # crop lq to a multiple of val_resolution and gt to the matching sf * size
-            offset = self.configs.train.get('val_resolution', 64)
+            offset = self.configs.train.get('val_resolution', None) or lq_multiple(self.configs)
             sf = self.configs.diffusion.params.sf
             lq = data['lq'].permute(0, 2, 1, 3, 4)                    # B x C x T x h x w
             h, w = lq.shape[-2:]
