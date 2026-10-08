@@ -280,7 +280,7 @@ class PatchUnEmbed(nn.Module):
         return x
  
 
-class SwinTransformerBlock_AdaFM(nn.Module):
+class SwinTransformerBlock_AdaLNZero(nn.Module):
     r""" Swin Transformer Block.
 
     Args:
@@ -300,7 +300,7 @@ class SwinTransformerBlock_AdaFM(nn.Module):
     """
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=normalization, emb_channels=160*4, fft_patch_size=8, **kwargs):
+                 act_layer=nn.GELU, norm_layer=normalization, emb_channels=160*4, **kwargs):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -331,15 +331,14 @@ class SwinTransformerBlock_AdaFM(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-        self.fft_patch_size = min(fft_patch_size, min(input_resolution))
-        self.adaLN_scale_msa = nn.Sequential(
+        # adaLN-Zero: shift/scale/gate for both the attention and the MLP branch, predicted from the
+        # timestep embedding. Zero-init makes every block an identity mapping at the start of training.
+        self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(emb_channels, self.fft_patch_size * (self.fft_patch_size // 2 + 1))
+            nn.Linear(emb_channels, 6 * dim)
         )
-        self.adaLN_scale_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_channels, self.fft_patch_size * (self.fft_patch_size // 2 + 1))
-        )
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def calculate_mask(self, x_size):
         # calculate attention mask for SW-MSA
@@ -376,20 +375,11 @@ class SwinTransformerBlock_AdaFM(nn.Module):
         x_size = (Ph, Pw)
         x_type = x.dtype
 
-        scale_msa = self.adaLN_scale_msa(t).reshape(t.shape[0], 1, 1, 1, self.fft_patch_size, self.fft_patch_size // 2 + 1)
-        scale_mlp = self.adaLN_scale_mlp(t).reshape(t.shape[0], 1, 1, 1, self.fft_patch_size, self.fft_patch_size // 2 + 1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(t)[:, :, None, None].chunk(6, dim=1)  # each B x C x 1 x 1
 
         shortcut = x
-        x = self.norm1(x)
-
-        # AdaFM
-        x_patch = rearrange(x, 'b c (h patch1) (w patch2) -> b c h w patch1 patch2', patch1=self.fft_patch_size,
-                            patch2=self.fft_patch_size)
-        x_patch_fft = torch.fft.rfft2(x_patch.float())
-        x_patch_fft *= scale_msa
-        x_patch = torch.fft.irfft2(x_patch_fft, s=(self.fft_patch_size, self.fft_patch_size)).to(x_type)
-        x = rearrange(x_patch, 'b c h w patch1 patch2 -> b c (h patch1) (w patch2)', patch1=self.fft_patch_size,
-                      patch2=self.fft_patch_size)
+        x = self.norm1(x) * (1 + scale_msa) + shift_msa
 
         # cyclic shift, shifted_x: B x C x Ph x Pw
         if self.shift_size > 0:
@@ -417,22 +407,13 @@ class SwinTransformerBlock_AdaFM(nn.Module):
         else:
             x = shifted_x
 
-        x = shortcut + self.drop_path(x)
-        
+        x = shortcut + self.drop_path(gate_msa * x)
+
         shortcut = x
-        x = self.norm2(x)
-        
-        # AdaFM
-        x_patch = rearrange(x, 'b c (h patch1) (w patch2) -> b c h w patch1 patch2', patch1=self.fft_patch_size,
-                            patch2=self.fft_patch_size)
-        x_patch_fft = torch.fft.rfft2(x_patch.float())
-        x_patch_fft *= scale_mlp
-        x_patch = torch.fft.irfft2(x_patch_fft, s=(self.fft_patch_size, self.fft_patch_size)).to(x_type)
-        x = rearrange(x_patch, 'b c h w patch1 patch2 -> b c (h patch1) (w patch2)', patch1=self.fft_patch_size,
-                      patch2=self.fft_patch_size)
-        
+        x = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+
         # FFN
-        x = shortcut + self.drop_path(self.mlp(x))
+        x = shortcut + self.drop_path(gate_mlp * self.mlp(x))
         return x
 
 
@@ -504,7 +485,7 @@ class BasicLayer(TimestepBlock):
         self.input_resolution = input_resolution
 
         self.blocks = nn.ModuleList([
-            SwinTransformerBlock_AdaFM(
+            SwinTransformerBlock_AdaLNZero(
                         dim=embed_dim,
                         input_resolution=input_resolution,
                         num_heads=num_heads,

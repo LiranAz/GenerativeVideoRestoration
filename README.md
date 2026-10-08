@@ -24,7 +24,7 @@ Telecommunications
 
 We propose DiT-SR, an effective diffusion transformer for real-world image super resolution:
  - Effective yet efficient architecture design;
- - Adaptive Frequence Modulation (AdaFM) for time step.
+ - Adaptive Frequence Modulation (AdaFM) for time step (this fork replaces it with adaLN-Zero, see UPSTREAM.md).
 
 <p align="center">
   <img src="assets/framework.jpg">
