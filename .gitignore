@@ -2,3 +2,7 @@
 
 __pycache__/
 *.pyc
+
+demo_data/
+runs/
+results/

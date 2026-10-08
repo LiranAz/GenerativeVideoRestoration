@@ -1,50 +1,71 @@
 <div align="center">
 <h2>Generative Video Restoration</h2>
-<p>Pixel-space video super-resolution with a diffusion transformer, forked from
+<p>Pixel-space video super-resolution / restoration with a diffusion transformer, forked from
 <a href="https://github.com/kunncheng/DiT-SR">DiT-SR</a> (<a href="https://arxiv.org/abs/2409.19589">arXiv 2409.19589</a>).</p>
 </div>
 
-> **Status: research code, untrained.** The video pipeline has only been checked on CPU with small random-weight models
-> (shapes, a few training steps, validation, windowed/tiled inference). No video model has been trained and there are no
-> pretrained weights. Upstream DiT-SR checkpoints do **not** load (see [What changed](#what-changed-from-dit-sr)).
+> **Status: research code, untrained.** The whole pipeline (data → training → validation → inference → evaluation) has been
+> run end to end, but only on CPU with small random-weight models. No video model has been trained, there are **no pretrained
+> weights**, and GPU memory use / speed at full size have not been measured. Upstream DiT-SR checkpoints do **not** load.
 
-## What changed from DiT-SR
+**Contents**
+[Overview](#overview) · [Requirements and installation](#requirements-and-installation) · [Quickstart (10 minutes, no data needed)](#quickstart) ·
+[Prepare your data](#prepare-your-data) · [Scenarios: one command each](#scenarios-one-command-each) ·
+[What you get](#what-you-get-outputs) · [Configuration reference](#configuration-reference) · [Inference in detail](#inference-in-detail) ·
+[Evaluation](#evaluation) · [Image restoration](#image-restoration-upstream-pipeline) · [Troubleshooting](#troubleshooting) ·
+[Repository layout](#repository-layout) · [Limitations](#known-limitations) · [Citation](#citation-and-acknowledgement)
+
+**How the pieces fit together:** see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): flow charts of what calls what for training,
+one training iteration, the model, validation, inference/sampling, patch aggregation and evaluation, plus the file hierarchy and a
+per-scenario table.
+
+---
+
+## Overview
+
+**Task.** Given a low-quality (LQ) video, produce a restored video that is `sf`× larger (4× or 2×) and temporally consistent.
+
+**Method in one paragraph.** A conditional diffusion model works directly on RGB pixels (no autoencoder). The reverse process
+starts from the bicubic-upsampled LQ video plus noise and refines it in a few steps (15 by default; ResShift-style
+diffusion that shifts the residual between LQ and HR). The denoiser is a UNet whose blocks are Swin transformers conditioned on the
+diffusion time step with **adaLN-Zero**, extended by **temporal attention** across frames. Training clips are degraded on the fly
+with the Real-ESRGAN pipeline (blur, resize, noise, JPEG, second order). At inference, long videos are processed by overlapping
+temporal windows and spatial tiles, or optionally by a WeatherDiff-style **patch aggregation** that keeps all patches consistent
+at every diffusion step.
+
+**What changed compared to DiT-SR**
 
 | | DiT-SR (upstream) | This repo |
 |---|---|---|
 | Input | one image `[B,3,H,W]` | one image **or** N frames `[B,3,T,H,W]` |
 | Space | latent (VQ autoencoder, f4/f8) | **pixel space**, no autoencoder |
 | Time-step conditioning | AdaFM (FFT-domain scaling) | **adaLN-Zero** (shift/scale/gate, zero-initialised) |
-| Temporal modelling | – | **temporal self-attention** in every Swin block, gated by adaLN-Zero |
-| Data / trainer / sampler | image only | image **and** video (`trainer_video.py`, `sampler_video.py`) |
+| Temporal modelling | – | **temporal self-attention** in every Swin block |
+| Data / trainer / sampler | images | images **and** videos |
+| Long inputs | tiles | temporal windows × tiles, or patch aggregation |
 
-Details:
+Design details:
 
-- **Video model.** Frames are folded into the batch for all per-frame layers (convs, window attention, MLP). Each Swin
-  block adds a temporal attention branch that attends across the T frames at every spatial position, with a sinusoidal
-  frame-index embedding, so any T works at inference. The temporal gate starts at zero: at initialisation a video behaves
-  exactly like per-frame image SR. `temporal_attn: False` in the model params disables it. The temporal branch also runs for `T=1` (single frames/images),
-  where attention over one frame reduces to a value/output projection; this keeps all parameters in the graph, so training
-  with `num_frames: 1` (or on single images) also works with multi-GPU DDP, and every `T` uses the same code path.
-- **Pixel space.** To keep the compute of the old latent UNet, `DiTSRModel(patch_size=p)` pixel-unshuffles the input into
-  channels (`p=4` for real-world SR, `p=8` for faces), runs the UNet at `image_size = H/p`, and shuffles the output back.
-  The low-quality condition is bicubic-resized to the size of `x` inside the model.
-- **Tensor shapes** (real-world SR config, `sf=4`, `p=4`):
+- **Frames are folded into the batch** for every per-frame layer (convs, window attention, MLP); only the temporal attention mixes
+  frames. Its gate starts at 0, so a fresh model behaves like per-frame image SR. It also runs for `T=1`, so every parameter always
+  takes part in training (multi-GPU safe) and one code path serves every `T`. `model.params.temporal_attn: False` removes it.
+- **Pixel space without extra cost.** `DiTSRModel(patch_size=p)` pixel-unshuffles the input into channels (`p=4` for real-world
+  SR, 8 for faces), runs the UNet at `H/p`, and shuffles back, i.e. the compute of the old latent UNet. The LQ condition is
+  bicubic-resized to the HR grid inside the model, so `sf` can be 2 or 4 without changing the network.
+- **Interface** (4× config): noisy HR clip `[B,3,T,H,W]`, LQ condition `[B,3,T,H/4,W/4]`, time steps `[B]`, output `[B,3,T,H,W]`.
+  `H`, `W` must be multiples of `patch_size × 2^(levels-1) × window_size` (256 by default) unless patch aggregation is used.
+- Change log and licence note: [`UPSTREAM.md`](UPSTREAM.md).
 
-  | Tensor | Shape |
-  |---|---|
-  | noisy HR video `x` | `[B, 3, T, H, W]` |
-  | LQ condition `lq` | `[B, 3, T, H/4, W/4]` (same `T`) |
-  | timesteps | `[B]` (shared by all frames) |
-  | output | `[B, 3, T, H, W]` |
+---
 
-  `H` and `W` must be multiples of `patch_size × 8 × window_size` (256 for real-world SR, 512 for faces); pad otherwise.
-  The training crop is configurable (`degradation.gt_size`, default 256; see below).
-- Full change log and licence note: [`UPSTREAM.md`](UPSTREAM.md).
+## Requirements and installation
 
-## Installation
+- Linux, **an NVIDIA GPU with CUDA** (training and inference call `.cuda()`; there is no CPU mode), Python 3.10, PyTorch 2.1.1.
+- GPU memory has not been measured. If you run out of memory use `small_gpu`, lower `train.microbatch`, or `--fp32` off/on as needed
+  (see [Troubleshooting](#troubleshooting)).
+- `ffmpeg` is optional (only to extract frames, see below).
 
-```
+```bash
 git clone https://github.com/LiranAz/GenerativeVideoRestoration.git
 cd GenerativeVideoRestoration
 
@@ -52,240 +73,301 @@ conda create -n gvr python=3.10 -y
 conda activate gvr
 pip install -r requirements.txt
 ```
+The first run that builds LPIPS downloads the VGG weights (internet needed once).
 
-`requirements.txt` is upstream's (torch 2.1.1, xformers optional). Training needs a CUDA GPU; LPIPS downloads VGG weights on
-first use.
+---
 
-## Video restoration
+## Quickstart
 
-### Data
-A *video* is either a folder of frames (sorted by file name) or a video file (`.mp4 .avi .mov .mkv .webm`).
-Edit `configs/vsr_DiT.yaml`:
+One command creates a synthetic dataset, trains a **tiny** model for 20 iterations (with validation), restores the validation
+videos and evaluates them. It proves that your installation, GPU and the whole pipeline work; the result is not meant to look good.
 
-```yaml
-data:
-  train:
-    params:
-      dir_paths: ['/path/to/train_videos']   # searched recursively
-      num_frames: 5                          # T per training clip
-      frame_stride: [1, 2]                   # temporal stride, random per clip
-  val:
-    params:
-      lq_path: /path/to/val_videos/lq        # optional validation set
-      gt_path: /path/to/val_videos/gt        # same video names as in lq_path
+```bash
+bash scripts/quickstart.sh
+```
+What happens (each step is also a command you can run alone, see the next sections):
+
+| Step | Command | Output |
+|---|---|---|
+| 1 | `scripts/run_scenario.sh demo-data` | `demo_data/{train,val/gt,val/lq,val/lq_x2}` (8 training videos, 2 validation videos) |
+| 2 | `scripts/run_scenario.sh smoke --train demo_data/train --val_lq demo_data/val/lq --val_gt demo_data/val/gt --out runs/quickstart` | logs with `Train:` and `Validation Metric` lines, `runs/quickstart/<timestamp>/` |
+| 3 | `scripts/run_scenario.sh infer --scenario smoke --ckpt <ema checkpoint> --input demo_data/val/lq --out runs/quickstart/results` | restored frames |
+| 4 | `scripts/run_scenario.sh evaluate --sr runs/quickstart/results --gt demo_data/val/gt` | PSNR / SSIM / TDE table |
+
+Everything below uses the same `scripts/run_scenario.sh` (run it without arguments, or with `help`, to see all options).
+
+---
+
+## Prepare your data
+
+A **video** is either a **folder of frames** (sorted by file name: `00000.png`, `00001.png`, ...) or a **video file**
+(`.mp4 .avi .mov .mkv .webm`). A dataset argument is a folder that contains videos; it is searched **recursively**.
+
+```
+train_videos/                      val_videos/
+├── clip_a/        (frames)        ├── lq/                   LQ input, e.g. 1/4 resolution
+│   ├── 00000.png                  │   ├── v1/ 00000.png ...
+│   └── ...                        │   └── v2.mp4
+├── clip_b.mp4                     └── gt/                   ground truth, same names as in lq/
+└── group/clip_c/ ...                  ├── v1/ 00000.png ...
+                                       └── v2.mp4
 ```
 
-**Crop size.** The training crop is one config value, `degradation.gt_size` (HR pixels, default 256). Everything that depends
-on it is derived or checked by `utils/util_crop.py` at start-up (`main.py`, `TrainerDifVSR`, `inference_video.py`):
-`model.params.image_size` (`~` = auto, `gt_size / patch_size`), the dataset crop (`data.train.params.gt_size:
-${degradation.gt_size}`), `patch_restoration.patch_size` (`~` = the crop) and the validation/inference LQ multiple
-(`train.val_resolution: ~`). The crop must be a multiple of `patch_size * 2^(levels-1)` and every UNet level must be a
-multiple of `window_size` (or not larger than it), otherwise you get an explanatory error: with the default model,
-multiples of 256 always work, and e.g. 128 works too. `crop_type: random|center` selects where the crop is taken;
-`num_frames` and `frame_stride` control the temporal crop. If you change the crop, also check
-`model.params.attention_resolutions` (the resolutions of the folded UNet levels, i.e. `gt_size / patch_size / 2^k`;
-a warning is raised if none matches), and note that a checkpoint is only valid for the crop it was trained with.
+- **Training videos** are the *high-quality* originals. The low-quality version is synthesised on the fly (Real-ESRGAN degradation),
+  so you only need good HR video, at least `gt_size` (256 px by default) on the shorter side (smaller ones are upscaled). Videos
+  shorter than the clip length repeat their last frame.
+- **Validation** (optional but recommended) needs LQ clips and, for PSNR/LPIPS, the matching GT clips with the **same names**.
+  The LQ must be exactly `sf`× smaller than GT. Make them from GT frames, e.g. with ffmpeg:
+  ```bash
+  ffmpeg -i gt/v2.mp4 -vf "scale=iw/4:ih/4:flags=bicubic" lq/v2.mp4
+  ```
+- **Extract frames from a video** (a frame folder is lossless, mp4 is convenient):
+  ```bash
+  mkdir -p train_videos/clip_a && ffmpeg -i clip_a.mp4 train_videos/clip_a/%05d.png
+  ```
+- No data at hand? `scripts/run_scenario.sh demo-data` writes a synthetic set (not realistic; for testing the pipeline only).
+- Public video SR datasets (for example REDS or Vimeo-90K) can be used by pointing `--train` at their frame folders; this repo does not
+  download datasets.
 
-Training clips are cropped to `gt_size` and flipped identically for all frames. The Real-ESRGAN degradation is applied on
-the GPU with **one set of blur kernels and one JPEG quality per clip**; resize factors and noise type are shared by the
-batch, and noise is sampled independently for every frame.
+---
 
-### Example configs and run instructions
-All example configs live in `configs/examples/` and only list what differs from `configs/vsr_DiT.yaml` (they start with
-`_base_: configs/vsr_DiT.yaml`; lists are replaced, other keys are merged). Any config value can be overridden on the
-command line with `--set key=value ...` (both `main.py` and `inference_video.py`), so you never have to edit a file
-just to point at your data. Replace `<...>` placeholders; use `torchrun --standalone --nproc_per_node=<gpus> --nnodes=1`
-instead of `python` for multi-GPU training.
+## Scenarios: one command each
 
-| # | Scenario | Config | Use it for |
-|---|---|---|---|
-| 1 | Smoke test | `configs/examples/vsr_smoke_test.yaml` | check data, training, validation, checkpoints in minutes (tiny model, 20 iterations) |
-| 2 | Standard video SR, 4x | `configs/vsr_DiT.yaml` | real training: 256 px crops, 5-frame clips, 56M parameters |
-| 3 | Small GPU | `configs/examples/vsr_small_gpu.yaml` | 128 px crops, 3-frame clips, 20M parameters, gradient accumulation |
-| 4 | Single frames | `configs/examples/vsr_single_frame.yaml` | image-style training from videos / frame folders (`T=1`) |
-| 5 | 2x upscaling | `configs/examples/vsr_x2.yaml` | `sf=2` instead of `sf=4` |
-| 6 | Resume / fine-tune | any of the above | continue a run, or start from a checkpoint |
-| 7 | Inference | `configs/vsr_DiT.yaml` or `configs/examples/vsr_patch_inference.yaml` | restore videos, tiled or WeatherDiff-style patch aggregation |
-| 8 | Evaluation | – | PSNR / SSIM / LPIPS / temporal difference error |
+`scripts/run_scenario.sh <scenario> [options]` wraps `main.py` / `inference_video.py` / `evaluate_video.py`. It picks the right
+config, passes your paths, and uses `torchrun` automatically when several GPUs are visible (`GPUS=n` to choose). Every scenario is a
+config under `configs/examples/` that only lists what differs from `configs/vsr_DiT.yaml` (`_base_:` inheritance); any value can be
+overridden on the command line (append `-- key=value ...`, i.e. `--set` in the raw commands).
+Replace `<...>` with your paths. Quote paths that contain spaces or commas.
 
-The data arguments used below (`dir_paths`, `lq_path`, `gt_path`) are searched recursively; a video is a folder of frames or
-a video file. The validation set needs `lq_path`; `gt_path` is optional (`--set data.val.params.gt_path=null`: validation then only
-writes restored images and skips PSNR/LPIPS).
+| # | Scenario | Config | Use it for | Cost |
+|---|---|---|---|---|
+| 1 | `smoke` | `configs/examples/vsr_smoke_test.yaml` | verify the setup | minutes, tiny model |
+| 2 | `standard` | `configs/vsr_DiT.yaml` | real 4× video SR (256 px crops, 5 frames, 56M params) | days |
+| 3 | `small_gpu` | `configs/examples/vsr_small_gpu.yaml` | 128 px crops, 3 frames, 20M params | smaller GPUs |
+| 4 | `single_frame` | `configs/examples/vsr_single_frame.yaml` | image-style training from video frames (`T=1`) | like 2 |
+| 5 | `x2` | `configs/examples/vsr_x2.yaml` | 2× instead of 4× | like 2 |
+| 6 | resume / fine-tune | any of the above | continue a run / start from weights | – |
+| 7 | `infer` | training config, or `vsr_patch_inference.yaml` | restore videos (tiled, or patch aggregation) | – |
+| 8 | `evaluate` | – | PSNR / SSIM / LPIPS / temporal difference error | – |
 
-**1. Smoke test** (tiny model, `use_amp: False`, so it also runs on small or older GPUs)
+**1. Smoke test**: check data paths, GPU, training, validation, checkpoints.
+```bash
+scripts/run_scenario.sh smoke --train <train_videos> --val_lq <val_lq> --val_gt <val_gt>
 ```
-python main.py --cfg_path configs/examples/vsr_smoke_test.yaml --save_dir runs/smoke \
-  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+**2. Standard video SR (4×)**
+```bash
+scripts/run_scenario.sh standard --train <train_videos> --val_lq <val_lq> --val_gt <val_gt> --out runs/vsr
 ```
-Expect `Train: ...`, `Validation Metric ...` lines and `runs/smoke/<timestamp>/{ckpts,ema_ckpts,images}`.
+Defaults: `batch: [16, 1]`, `microbatch: 2` (gradient accumulation = batch/microbatch), 300k iterations, mixed precision.
 
-**2. Standard video SR (4x)**
+**3. Small GPU**: crop 128, 3 frames, narrower model. The crop is one config value, `degradation.gt_size`; everything that depends
+on it is derived and validated (see [Crop size](#crop-size)).
+```bash
+scripts/run_scenario.sh small_gpu --train <train_videos> --val_lq <val_lq> --val_gt <val_gt>
 ```
-torchrun --standalone --nproc_per_node=<gpus> --nnodes=1 main.py --cfg_path configs/vsr_DiT.yaml --save_dir runs/vsr \
-  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+**4. Single frames (`T=1`)**: use when you only want per-frame restoration, or to pre-train before clips. The temporal layers still run
+(attention over one frame), so the checkpoint can later be fine-tuned on clips (scenario 6).
+```bash
+scripts/run_scenario.sh single_frame --train <train_videos_or_frame_folders> --val_lq <val_lq> --val_gt <val_gt>
 ```
-Defaults: `batch: [16, 1]`, `microbatch: 2`, 300k iterations, mixed precision. Reduce `microbatch` if you run out of memory
-(`batch / microbatch` = gradient accumulation steps).
-
-**3. Small GPU (about 12-16 GB)**
+**5. 2× upscaling**: validation LQ must be 2× smaller than GT. LQ sizes are multiples of 128 px at 2× (64 at 4×).
+```bash
+scripts/run_scenario.sh x2 --train <train_videos> --val_lq <val_lq_x2> --val_gt <val_gt>
+scripts/run_scenario.sh infer --scenario x2 --scale 2 --ckpt <ckpt> --input <lq_x2_video> --out results_x2
 ```
-python main.py --cfg_path configs/examples/vsr_small_gpu.yaml --save_dir runs/small \
-  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
-```
-The crop is changed in one place (`degradation.gt_size: 128`); the UNet resolution, dataset crop and patch size follow
-(see *Crop size* above). `attention_resolutions` is adapted in the config because the folded UNet levels are 32/16/8/4.
-Inference with a checkpoint from this config needs the same `--config_path` (the crop is part of the architecture).
-
-**4. Single frames (`T=1`)**
-```
-python main.py --cfg_path configs/examples/vsr_single_frame.yaml --save_dir runs/single \
-  --set "data.train.params.dir_paths=[<train_videos_or_frame_folders>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
-```
-The temporal layers still run (attention over one frame) so the checkpoint can later be used on clips or fine-tuned with
-scenario 2 via `model.ckpt_path`.
-
-**5. 2x upscaling**
-```
-python main.py --cfg_path configs/examples/vsr_x2.yaml --save_dir runs/x2 \
-  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq_x2> data.val.params.gt_path=<val_gt>
-python inference_video.py -i <lq_x2_video> -o results_x2 --config_path configs/examples/vsr_x2.yaml \
-  --ckpt_path runs/x2/<timestamp>/ckpts/model_<iter>.pth --scale 2 --chop_size 128 --chop_stride 96
-```
-At 2x the LQ multiple is 128 pixels, so `--chop_size` must be a multiple of 128 (64 at 4x) and validation LQ clips are cropped
-to multiples of 128.
-
 **6. Resume or fine-tune**
+```bash
+# continue the same run: restores model, EMA, learning-rate schedule and counters (use the same scenario/config)
+scripts/run_scenario.sh standard --train <train_videos> --val_lq <val_lq> --val_gt <val_gt> --out runs/vsr \
+    --resume runs/vsr/<timestamp>/ckpts/model_<iter>.pth
+# start a NEW run from existing weights, e.g. single-frame -> clips
+scripts/run_scenario.sh standard --train <train_videos> --val_lq <val_lq> --val_gt <val_gt> --out runs/finetune \
+    --init runs/single_frame/<timestamp>/ckpts/model_<iter>.pth
 ```
-# continue the same run (restores model, EMA, learning rate schedule and log counters; keep the same config)
-python main.py --cfg_path configs/vsr_DiT.yaml --resume runs/vsr/<timestamp>/ckpts/model_<iter>.pth
-# start a NEW run from existing weights (e.g. single-frame -> clips)
-python main.py --cfg_path configs/vsr_DiT.yaml --save_dir runs/finetune \
-  --set model.ckpt_path=runs/single/<timestamp>/ckpts/model_<iter>.pth "data.train.params.dir_paths=[<train_videos>]"
+**7. Inference.** Use the **same scenario/config as in training** (the crop and model size are part of the architecture) and preferably
+the EMA weights (`ema_ckpts/ema_model_<iter>.pth`).
+```bash
+# tiled: temporal windows x spatial tiles, blended (works for any video size, padded internally)
+scripts/run_scenario.sh infer --scenario standard --ckpt runs/vsr/<ts>/ema_ckpts/ema_model_<iter>.pth --input <video_or_frames_or_folder> --out results
+# WeatherDiff-style patch aggregation: smoother, ~4x more compute, no tiling seams
+scripts/run_scenario.sh infer --scenario standard --ckpt <ckpt> --input <...> --out results_patch --patch
 ```
-`--resume` takes the checkpoint path and finds `ema_ckpts/ema_<name>.pth` next to it.
+The input can be a video file, a frame folder, or a folder of videos. Outputs: `.mp4` for video-file inputs, PNG frames for frame
+folders (add `-- --save_frames` to also get PNGs for videos). Details: [Inference in detail](#inference-in-detail).
 
-**7. Inference**
+**8. Evaluate** (restored vs. ground truth, paired by name)
+```bash
+scripts/run_scenario.sh evaluate --sr results --gt <gt_videos> --metrics psnr,ssim,tde
 ```
-# tiled (default): temporal windows x spatial tiles, blended
-python inference_video.py -i <video_or_frames_or_folder> -o results --config_path configs/vsr_DiT.yaml \
-  --ckpt_path runs/vsr/<timestamp>/ema_ckpts/ema_model_<iter>.pth
-# WeatherDiff-style patch aggregation (smoother, ~4x more compute; any size >= one patch)
-python inference_video.py -i <video_or_frames_or_folder> -o results_patch --config_path configs/examples/vsr_patch_inference.yaml \
-  --ckpt_path runs/vsr/<timestamp>/ema_ckpts/ema_model_<iter>.pth
-# same thing without a separate config
-python inference_video.py -i <...> -o results_patch --config_path configs/vsr_DiT.yaml --ckpt_path <...> --patch_restoration true
-```
-Use the EMA weights (`ema_ckpts/ema_model_<iter>.pth`) for best results; plain checkpoints are `ckpts/model_<iter>.pth`.
-Memory knobs: `--chop_size/--chop_stride` (tiled mode), `--num_frames/--frame_overlap` (both modes),
-`patch_restoration.batch_size` / `patch_stride` (patch mode). Add `--fp32` to disable mixed precision.
 
-**8. Evaluation** (restored videos against ground truth, paired by name)
-```
+**Without the wrapper.** `scripts/run_scenario.sh` only builds these commands:
+```bash
+python main.py --cfg_path configs/vsr_DiT.yaml --save_dir runs/vsr \
+    --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+torchrun --standalone --nproc_per_node=<gpus> --nnodes=1 main.py ...            # several GPUs
+python inference_video.py -i <video> -o results --config_path configs/vsr_DiT.yaml --ckpt_path <ckpt> [--patch_restoration true]
 python evaluate_video.py -i results -r <gt_videos> --metrics psnr,ssim,tde --out_json metrics.json
 ```
 
-### Train
-```
-torchrun --standalone --nproc_per_node=<gpus> --nnodes=1 main.py --cfg_path configs/vsr_DiT.yaml --save_dir ${save_dir}
-```
-Checkpoints go to `${save_dir}/ckpts` (and EMA weights to `${save_dir}/ema_ckpts`). `batch`, `microbatch` and
-`degradation.queue_size` in the config are untuned guesses; the training-pair pool stores whole clips, so lower
-`queue_size` if memory is tight. Add `--resume` to continue from `save_dir`.
+---
 
-### Inference
-```
-python inference_video.py -i input.mp4 -o results --ckpt_path ${save_dir}/ckpts/model_xxx.pth --config_path configs/vsr_DiT.yaml
-```
-`-i` can be a video file, a folder of frames, or a folder of videos. Output is an `.mp4` (add `--save_frames` for PNG
-frames; frame folders are always written as PNGs).
-
-Long videos are handled with sliding temporal windows (`--num_frames`, `--frame_overlap`) and overlapping spatial tiles
-(`--chop_size`, `--chop_stride`, in LQ pixels; `chop_size` must be a multiple of the LQ unit: 64 at 4x, 128 at 2x). Overlaps are blended with smooth
-weights, and the initial noise of every frame depends only on the seed, the frame index and the pixel position, so
-overlapping windows and tiles start from identical noise and agree with each other.
-
-### Evaluate
-```
-python evaluate_video.py -i results/ -r gt_videos/ --metrics psnr,ssim,tde --out_json metrics.json
-```
-Restored and ground-truth videos (files, frame folders, or folders of them) are paired by name. Metrics are computed per
-frame on the Y channel (8-bit) and averaged: `psnr`, `ssim`, `lpips` (needs the LPIPS weights) and `tde`, the
-*temporal difference error* `mean |(SR_{t+1}-SR_t) - (GT_{t+1}-GT_t)|`, which grows with flicker and temporal drift.
-`evaluate.py` is the upstream image-only script (no-reference metrics via `pyiqa`, needs a GPU and downloads weights).
-
-### Optional: WeatherDiff-style patch-based restoration
-Instead of restoring tiles independently, the whole clip can be restored in **one** reverse process in which, at every
-step, the model is applied to overlapping space-time patches of the current `x_t`, the outputs are averaged per pixel and
-one diffusion update is done on the full tensor (idea from [WeatherDiffusion](https://github.com/IGITUGraz/WeatherDiffusion);
-implementation in `patch_restoration.py`, class `PatchDiffusiveRestoration` / wrapper `PatchAggregatedModel`). Neighbouring
-patches then stay consistent at every step, so there are no tiling seams, and any input size >= `patch_size` works.
-
-It is **off by default**; enable it in `configs/vsr_DiT.yaml`:
-```yaml
-patch_restoration:
-  enabled: True
-  patch_size: 256      # HR pixels; must equal the training crop (degradation.gt_size)
-  patch_stride: 128    # HR pixels; patch_size // 2 = 4x the cost of non-overlapping patches
-  patch_frames: ~      # temporal patch length (~ = all frames of the clip)
-  frame_stride: ~      # temporal stride (~ = patch_frames // 2)
-  weighting: uniform   # uniform (WeatherDiff) | tent (down-weights patch borders)
-  batch_size: 8        # patches per model call
-```
-or per run with `python inference_video.py ... --patch_restoration true`. The block is also used by validation in
-`trainer_video.py`. When enabled, `--chop_size/--chop_stride` are ignored; the temporal windows are still used for long
-videos. Programmatic use:
-```python
-from patch_restoration import PatchDiffusiveRestoration
-restorer = PatchDiffusiveRestoration(base_diffusion, model.eval(), cfg_dict, sf=4)
-sr = restorer.restore(lq)          # lq: [B,3,T,h,w] (or [B,3,h,w]) in [-1, 1]
-```
-The cost grows with the overlap: patches per pixel = (patch_size / patch_stride)² (x the temporal overlap).
-
-## Image restoration (upstream pipeline, still available)
-
-The original single-image pipeline works with the pixel-space model; `configs/realsr_DiT.yaml`, `configs/realsr_DiT_Lite.yaml`
-and `configs/faceir_DiT.yaml` are kept. You have to train from scratch (upstream weights are for the latent model).
-
-Training data of upstream: [LSDIR](https://huggingface.co/ofsoundof/LSDIR), [DIV2K](https://data.vision.ee.ethz.ch/cvl/DIV2K/),
-[DIV8K](https://ieeexplore.ieee.org/document/9021973), [OutdoorSceneTraining](https://mmlab.ie.cuhk.edu.hk/projects/SFTGAN/),
-[Flickr2K](https://www.kaggle.com/datasets/hliang001/flickr2k) and the first 10K [FFHQ](https://github.com/NVlabs/ffhq-dataset)
-faces; the image paths are listed in `data_list/*.txt`.
+## What you get (outputs)
 
 ```
-# real-world image SR
-torchrun --standalone --nproc_per_node=8 --nnodes=1 main.py --cfg_path configs/realsr_DiT.yaml --save_dir ${save_dir}
-# blind face restoration
-torchrun --standalone --nproc_per_node=8 --nnodes=1 main.py --cfg_path configs/faceir_DiT.yaml --save_dir ${save_dir}
-# inference (edit the checkpoint path in the scripts)
-bash test_realsr.sh
-bash test_faceir.sh
+runs/<name>/<timestamp>/
+├── training.log          full config + loss / validation lines
+├── ckpts/model_<iter>.pth        weights + counters (use for --resume)
+├── ema_ckpts/ema_model_<iter>.pth   EMA weights (use for inference; best quality)
+└── images/{train,val}/   lq / gt / diffused / x0-pred grids (training), sr / lq / gt grids (validation); one row per clip
 ```
-`test_realsr.sh` / `test_faceir.sh` point at the upstream checkpoints `weights/realsr.pth` / `weights/faceir.pth`, which do not
-match this architecture; pass your own trained checkpoint instead.
+Validation (every `train.val_freq` iterations) logs `PSNR` and `LPIPS` averaged over frames (without `gt_path` it only writes images).
+Inference writes `<out>/<video name>.mp4` and/or `<out>/<video name>/<frame>.png`.
+
+---
+
+## Configuration reference
+
+All keys live in `configs/vsr_DiT.yaml` (commented). The ones you will touch:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `degradation.gt_size` | 256 | **training crop** (HR px). One place; see [Crop size](#crop-size) |
+| `degradation.sf` / `diffusion.params.sf` | 4 / 4 | upscaling factor (keep equal) |
+| `degradation.queue_size` | 64 | training-pair pool (clips kept on the GPU for diversity); must be divisible by the batch size |
+| `data.train.params.dir_paths` | placeholder | training videos |
+| `data.train.params.num_frames` / `frame_stride` | 5 / `[1,2]` | temporal crop: frames per clip, random stride |
+| `data.train.params.crop_type` | `random` | `random` or `center` spatial crop |
+| `data.train.params.reverse_prob` | 0.1 | chance to play a clip backwards |
+| `data.val.params.lq_path` / `gt_path` / `num_frames` | placeholder / placeholder / 5 | validation set (`gt_path: null` skips metrics) |
+| `model.params.model_channels`, `swin_embed_dim`, `swin_depth` | 128, 160, 4 | model width / depth (56M params) |
+| `model.params.patch_size` | 4 | pixel-unshuffle factor; `image_size` is derived from the crop (`~`) |
+| `model.params.attention_resolutions` | `[64,32,16]` | folded UNet resolutions with transformer layers |
+| `model.params.temporal_attn` | true | temporal attention on/off |
+| `model.ckpt_path` | `~` | initialise from weights (fine-tuning) |
+| `diffusion.params.steps` | 15 | diffusion steps (also the inference cost) |
+| `train.lr`, `warmup_iterations`, `iterations` | 5e-5, 5000, 300000 | optimisation |
+| `train.batch` | `[16, 1]` | `[training batch over all GPUs, validation batch]` |
+| `train.microbatch` | 2 | clips per forward/backward; lower it for less memory |
+| `train.save_freq` / `val_freq` | 10000 / same | checkpoint / validation interval (iterations) |
+| `train.log_freq` | `[200, 2000, 1]` | `[loss, training images, validation images]`; must be ≥ 2 for the first entry |
+| `train.use_amp`, `ema_rate` | true, 0.999 | mixed precision, EMA decay |
+| `train.num_workers` | 4 | data loader processes (must be ≥ 1) |
+| `patch_restoration.*` | disabled | [patch aggregation](#inference-in-detail) |
+
+**Config inheritance and overrides.** A config may start with `_base_: configs/vsr_DiT.yaml`; keys are merged, lists replaced.
+`--set key=value ...` overrides anything last, e.g. `--set train.iterations=1000 'data.train.params.dir_paths=[/data/a,/data/b]'`.
+
+### Crop size
+The training crop is the single value `degradation.gt_size` (HR pixels). At start-up `utils/util_crop.py` derives or checks everything
+that depends on it: `model.params.image_size` (`gt_size / patch_size`), the dataset crop (`data.train.params.gt_size:
+${degradation.gt_size}`), `patch_restoration.patch_size` and the LQ size step for validation and inference. The crop must be a
+multiple of `patch_size × 2^(levels-1)` and every UNet level a multiple of `window_size` (or not larger than it); otherwise you get an
+error that names the valid multiples (multiples of 256 always work with the default model, 128 works too). When you change the crop,
+also adapt `attention_resolutions` (a warning appears if none matches), and remember that a checkpoint is only valid for the
+crop and model size it was trained with.
+
+---
+
+## Inference in detail
+
+`inference_video.py -i <video(s)> -o <out> --config_path <cfg> --ckpt_path <ckpt>`
+
+- **Tiled (default).** The video is cut into temporal windows (`--num_frames`, default = training clip length; `--frame_overlap`, default
+  2) and each window into overlapping spatial tiles (`--chop_size`, `--chop_stride`, in LQ pixels; the size must be a multiple of the LQ
+  unit: 64 at 4×, 128 at 2×). Every frame starts from the same noise (a function of seed, frame index, position), and overlaps are blended
+  with smooth weights, which keeps tiles and windows consistent.
+- **Patch aggregation (optional, off by default).** Following [WeatherDiffusion](https://github.com/IGITUGraz/WeatherDiffusion):
+  the whole window is restored in *one* reverse process; at every step the model is applied to overlapping space-time patches of the
+  current state, outputs are averaged per pixel, and one diffusion update is done on the full tensor, so patches can never drift apart.
+  Any input size ≥ one patch works. Enable with `--patch_restoration true` (or `patch_restoration.enabled: True`, e.g.
+  `configs/examples/vsr_patch_inference.yaml`):
+
+  | key | default | meaning |
+  |---|---|---|
+  | `patch_size` | `~` (= crop) | spatial patch, HR px; must equal the training crop |
+  | `patch_stride` | 128 | HR px; cost ≈ (patch_size / patch_stride)² model passes per pixel |
+  | `patch_frames`, `frame_stride` | `~`, `~` | temporal patch length / stride (`~` = whole window / half of it) |
+  | `weighting` | `uniform` | `tent` down-weights patch borders |
+  | `batch_size` | 8 | patches per model call |
+
+  The same block is used by validation inside training. Programmatic use:
+  ```python
+  from patch_restoration import PatchDiffusiveRestoration
+  sr = PatchDiffusiveRestoration(base_diffusion, model.eval(), cfg_dict, sf=4).restore(lq)   # lq [B,3,T,h,w] in -1..1
+  ```
+- **Memory/speed knobs:** `--num_frames`, `--frame_overlap`, `--chop_size`, `--chop_stride` (tiled); `patch_stride`, `batch_size`, `patch_frames`
+  (patch mode); `diffusion.params.steps`; `--fp32` disables mixed precision (slower, more memory).
+
+---
+
+## Evaluation
+
+```bash
+python evaluate_video.py -i results -r <gt_videos> --metrics psnr,ssim,tde --out_json metrics.json
+```
+Restored and ground-truth videos (files, frame folders, or folders of them) are paired by name (a single pair is paired regardless of
+names). Per frame on the 8-bit Y channel, averaged: `psnr`, `ssim`, `lpips` (needs LPIPS weights), and `tde`, the *temporal difference
+error* `mean |(SR_{t+1} − SR_t) − (GT_{t+1} − GT_t)|`, which grows with flicker and drift (lower is better). Use `--border N` to crop N pixels.
+
+---
+
+## Image restoration (upstream pipeline)
+
+The original single-image pipeline still runs on the pixel-space model: `configs/realsr_DiT.yaml`, `realsr_DiT_Lite.yaml`, `faceir_DiT.yaml`
+(training data lists in `data_list/*.txt`; images only, no video classes).
+```bash
+python main.py --cfg_path configs/realsr_DiT_Lite.yaml --save_dir runs/img      # train (edit the data paths in the config or use --set)
+python inference.py --task realsr --scale 4 --chop_size 256 --chop_stride 224 \
+    --config_path configs/realsr_DiT_Lite.yaml --ckpt_path <ckpt> -i <lq_images> -o results_img -r <gt_images>
+```
+`inference.py` ends with `evaluate.py`, which needs `pyiqa`, downloads metric weights and needs a GPU. `test_realsr.sh` / `test_faceir.sh`
+refer to upstream checkpoints that do not match this architecture; pass your own.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `CUDA out of memory` | lower `train.microbatch`; use `small_gpu`; fewer frames (`num_frames`); smaller `degradation.queue_size`. Inference: smaller `--chop_size`, `patch_restoration.batch_size`, or larger `patch_stride` |
+| `ValueError: ... must be a multiple of ...` at start-up | the crop does not fit the UNet; use the multiple named in the message (`degradation.gt_size`) |
+| `AssertionError: chop_size (..) must be a multiple of ..` | `--chop_size` must be a multiple of the LQ unit (64 at 4×, 128 at 2×) |
+| `size mismatch` / missing keys when loading a checkpoint | use the exact config (crop, model size, `temporal_attn`) the checkpoint was trained with; upstream DiT-SR weights never match |
+| `model.params.image_size is null` | build the model through `main.py`/`inference_video.py`, or call `utils.util_crop.resolve_crop(config)` first |
+| `prefetch_factor option could only be specified in multiprocessing` | `train.num_workers` must be ≥ 1 |
+| Loss logging crashes with `log_freq: [1, ...]` | the first `log_freq` entry must be ≥ 2 |
+| `No videos found in ...` | check the path; frame folders need image files directly inside; video files need a supported extension |
+| `--set` value is ignored / parse error | lists need brackets: `'x=[a,b]'`; quote paths with spaces; `null` sets a key to None |
+| DDP "parameters not used in the loss" | only possible with `temporal_attn: True` and a modified model; the temporal branch runs for any `T` |
+| Garbled/green frames from an `.mp4` | OpenCV could not decode the codec; re-encode (`ffmpeg -i in.mkv -c:v libx264 out.mp4`) or extract frames |
+| Validation shows no PSNR/LPIPS | no `data.val.params.gt_path` (it is optional) |
+| First start downloads files | LPIPS needs the VGG weights once (internet) |
+
+---
 
 ## Repository layout
 
 ```
-utils/util_crop.py          crop-size resolution/validation (single source: degradation.gt_size)
-models/unet.py              DiTSRModel (5-D input, pixel-unshuffle stem)
-models/swin_transformer.py  adaLN-Zero Swin block + TemporalAttention
-models/gaussian_diffusion.py  ResShift-style diffusion (pixel space, video-aware)
-datapipe/video_datasets.py  clip datasets (frame folders / video files)
-trainer.py                  image trainers (Real-ESRGAN degradation in TrainerDifIR._degrade)
-trainer_video.py            TrainerDifVSR: video training and validation
-sampler.py / inference.py   image sampler and CLI
-sampler_video.py / inference_video.py   windowed + tiled video sampler and CLI
-evaluate_video.py           PSNR / SSIM / LPIPS / temporal-difference error for videos
-patch_restoration.py        optional WeatherDiff-style per-step patch aggregation
-configs/                    vsr_DiT.yaml (video), realsr_*.yaml, faceir_DiT.yaml
+scripts/run_scenario.sh        one entry point for every scenario (train, infer, evaluate, demo data)
+scripts/quickstart.sh          demo data -> smoke training -> inference -> evaluation
+scripts/make_demo_data.py      synthetic demo dataset
+main.py                        training entrypoint            inference_video.py   video inference
+trainer_video.py / trainer.py  video / image trainers          sampler_video.py / sampler.py   video / image samplers
+patch_restoration.py           WeatherDiff-style patch aggregation
+evaluate_video.py              video metrics                   evaluate.py / inference.py     upstream image scripts
+configs/vsr_DiT.yaml           base video config               configs/examples/   scenario configs
+datapipe/video_datasets.py     video datasets                  datapipe/datasets.py   dataset factory
+models/                        DiTSRModel (unet.py), Swin + temporal attention, diffusion
+utils/                         util_config.py (inheritance, --set), util_crop.py (crop rules), helpers
+docs/ARCHITECTURE.md           flow charts and file hierarchy
 ```
 
 ## Known limitations
-- Untrained; quality, optimal `num_frames`/overlap and hyper-parameters are unknown.
-- Pixel-space diffusion is slower and harder to train than the latent version; memory grows with `T` (temporal attention is
-  `O(T²)` per position).
+- Untrained; quality, best `num_frames` / overlap / hyper-parameters are unknown. No pretrained weights.
+- GPU memory and speed were not measured; multi-GPU (DDP) training was not run.
+- Pixel-space diffusion is slower and harder to train than latent diffusion; memory grows with `T` (temporal attention is `O(T²)` per position).
 - Temporal attention is only active at the `attention_resolutions` levels and in the middle block; other layers are per-frame.
-- The degradation pipeline does not model temporal effects (e.g. video-codec artefacts or motion blur across frames).
+- The degradation does not model temporal effects (video-codec artefacts, motion blur across frames); noise is independent per frame.
 - Upstream DiT-SR ships no `LICENSE` file; check with its authors before redistributing or using this code beyond research.
 
 ## Citation and acknowledgement
@@ -301,6 +383,7 @@ This repo builds on DiT-SR; please cite it if you use this code:
   year={2025}
 }
 ```
-Thanks to the projects DiT-SR builds on: [ResShift](https://github.com/zsyOAOA/ResShift), [DiT](https://github.com/facebookresearch/DiT),
-[FFTFormer](https://github.com/kkkls/FFTformer), [SwinIR](https://github.com/JingyunLiang/SwinIR),
-[SinSR](https://github.com/wyf0912/SinSR) and [BasicSR](https://github.com/XPixelGroup/BasicSR).
+Patch aggregation follows the idea of WeatherDiffusion (Özdenizci & Legenstein, "Restoring Vision in Adverse Weather Conditions with
+Patch-Based Denoising Diffusion Models"). Thanks also to [ResShift](https://github.com/zsyOAOA/ResShift), [DiT](https://github.com/facebookresearch/DiT),
+[FFTFormer](https://github.com/kkkls/FFTformer), [SwinIR](https://github.com/JingyunLiang/SwinIR), [SinSR](https://github.com/wyf0912/SinSR)
+and [BasicSR](https://github.com/XPixelGroup/BasicSR).
