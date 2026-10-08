@@ -168,6 +168,10 @@ class DiTSRModel(nn.Module):
     ):
         super().__init__()
         kwargs['temporal_attn'] = temporal_attn
+        if image_size is None:
+            raise ValueError('model.params.image_size is null: it is derived from degradation.gt_size / patch_size by '
+                             'utils.util_crop.resolve_crop(configs) (called by main.py, TrainerDifVSR and '
+                             'inference_video.py); call it before building the model, or set image_size explicitly.')
 
         if num_heads == -1:
             assert swin_embed_dim % num_head_channels == 0 and num_head_channels > 0

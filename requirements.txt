@@ -18,3 +18,4 @@ albumentations
 einops
 imageio
 transformers
+pyiqa   # used by evaluate.py (inference.py)

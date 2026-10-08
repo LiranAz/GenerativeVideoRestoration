@@ -29,6 +29,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchvision.utils as vutils
 from torch.nn.parallel import DistributedDataParallel as DDP
+try:
+    from torch.utils.tensorboard import SummaryWriter   # only needed for train.tf_logging
+except ImportError:
+    SummaryWriter = None
 
 
 class TrainerBase:
