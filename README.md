@@ -97,6 +97,34 @@ Long videos are handled with sliding temporal windows (`--num_frames`, `--frame_
 weights, and the initial noise of every frame depends only on the seed, the frame index and the pixel position, so
 overlapping windows and tiles start from identical noise and agree with each other.
 
+### Optional: WeatherDiff-style patch-based restoration
+Instead of restoring tiles independently, the whole clip can be restored in **one** reverse process in which, at every
+step, the model is applied to overlapping space-time patches of the current `x_t`, the outputs are averaged per pixel and
+one diffusion update is done on the full tensor (idea from [WeatherDiffusion](https://github.com/IGITUGraz/WeatherDiffusion);
+implementation in `patch_restoration.py`, class `PatchDiffusiveRestoration` / wrapper `PatchAggregatedModel`). Neighbouring
+patches then stay consistent at every step, so there are no tiling seams, and any input size >= `patch_size` works.
+
+It is **off by default**; enable it in `configs/vsr_DiT.yaml`:
+```yaml
+patch_restoration:
+  enabled: True
+  patch_size: 256      # HR pixels; must equal the training crop (degradation.gt_size)
+  patch_stride: 128    # HR pixels; patch_size // 2 = 4x the cost of non-overlapping patches
+  patch_frames: ~      # temporal patch length (~ = all frames of the clip)
+  frame_stride: ~      # temporal stride (~ = patch_frames // 2)
+  weighting: uniform   # uniform (WeatherDiff) | tent (down-weights patch borders)
+  batch_size: 8        # patches per model call
+```
+or per run with `python inference_video.py ... --patch_restoration true`. The block is also used by validation in
+`trainer_video.py`. When enabled, `--chop_size/--chop_stride` are ignored; the temporal windows are still used for long
+videos. Programmatic use:
+```python
+from patch_restoration import PatchDiffusiveRestoration
+restorer = PatchDiffusiveRestoration(base_diffusion, model.eval(), cfg_dict, sf=4)
+sr = restorer.restore(lq)          # lq: [B,3,T,h,w] (or [B,3,h,w]) in [-1, 1]
+```
+The cost grows with the overlap: patches per pixel = (patch_size / patch_stride)² (x the temporal overlap).
+
 ## Image restoration (upstream pipeline, still available)
 
 The original single-image pipeline works with the pixel-space model; `configs/realsr_DiT.yaml`, `configs/realsr_DiT_Lite.yaml`
@@ -130,6 +158,7 @@ trainer.py                  image trainers (Real-ESRGAN degradation in TrainerDi
 trainer_video.py            TrainerDifVSR: video training and validation
 sampler.py / inference.py   image sampler and CLI
 sampler_video.py / inference_video.py   windowed + tiled video sampler and CLI
+patch_restoration.py        optional WeatherDiff-style per-step patch aggregation
 configs/                    vsr_DiT.yaml (video), realsr_*.yaml, faceir_DiT.yaml
 ```
 

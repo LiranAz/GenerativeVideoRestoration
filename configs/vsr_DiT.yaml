@@ -42,6 +42,20 @@ diffusion:
     normalize_input: True
     latent_flag: False
 
+# Optional WeatherDiff-style patch-based restoration (patch_restoration.py). Disabled by default.
+# When enabled, the whole clip is restored in ONE reverse process; at every step the model is applied to
+# overlapping space-time patches of the current x_t, the outputs are averaged per pixel, and one diffusion
+# update is done on the full tensor (no tiling seams, works for any input size >= patch_size).
+# Used by inference_video.py (override with --patch_restoration true/false) and by validation.
+patch_restoration:
+  enabled: False
+  patch_size: 256        # HR pixels; must equal the training crop (degradation.gt_size)
+  patch_stride: 128      # HR pixels; patch_size // 2 -> 4x the cost of non-overlapping patches
+  patch_frames: ~        # temporal patch length; ~ (null) -> all frames of the clip
+  frame_stride: ~        # temporal stride; ~ -> patch_frames // 2
+  weighting: uniform     # uniform (WeatherDiff) | tent (down-weights patch borders)
+  batch_size: 8          # patches per model call
+
 degradation:
   sf: 4
   # the first degradation process

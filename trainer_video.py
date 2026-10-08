@@ -13,6 +13,7 @@ from einops import rearrange
 
 from trainer import TrainerDifIR
 from utils import util_image
+from patch_restoration import get_patch_cfg, wrap_model
 
 
 class TrainerDifVSR(TrainerDifIR):
@@ -103,6 +104,8 @@ class TrainerDifVSR(TrainerDifIR):
             model = self.ema_model.eval()
         else:
             model = self.model.eval()
+        # optional WeatherDiff-style patch aggregation (config block `patch_restoration`)
+        model = wrap_model(model, get_patch_cfg(self.configs))
 
         num_clips = num_frames = 0
         mean_psnr = mean_lpips = 0.0

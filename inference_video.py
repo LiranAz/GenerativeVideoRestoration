@@ -17,6 +17,8 @@ def get_parser():
     parser.add_argument("--frame_overlap", type=int, default=2, help="Frames shared by consecutive windows.")
     parser.add_argument("--chop_size", type=int, default=128, help="Spatial tile size in LQ pixels (multiple of 64).")
     parser.add_argument("--chop_stride", type=int, default=96, help="Spatial tile stride in LQ pixels.")
+    parser.add_argument("--patch_restoration", type=str2bool, const=True, default=None, nargs="?",
+                        help="Override `patch_restoration.enabled` of the config (WeatherDiff-style patch aggregation).")
     parser.add_argument("--save_frames", type=str2bool, const=True, default=False, nargs="?", help="Also write PNG frames.")
     parser.add_argument("--fp32", type=str2bool, const=True, default=False, nargs="?", help="disable amp")
     parser.add_argument("--seed", type=int, default=12345)
@@ -33,6 +35,7 @@ def main():
             chop_size=args.chop_size, chop_stride=args.chop_stride,
             num_frames=args.num_frames, frame_overlap=args.frame_overlap,
             padding_offset=max(configs.model.params.get('lq_size', 64), 64), seed=args.seed,
+            patch_restoration=args.patch_restoration,
             )
     sampler.inference(args.in_path, args.out_path, save_frames=args.save_frames)
 

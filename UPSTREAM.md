@@ -26,3 +26,8 @@ or relying on this code beyond research use. The original README is kept unchang
 - Video pipeline: `datapipe/video_datasets.py` (clip datasets), `trainer_video.py` (`TrainerDifVSR`, config
   `configs/vsr_DiT.yaml`), `sampler_video.py` / `inference_video.py` (windowed + tiled inference). The image
   trainer's Real-ESRGAN degradation was factored into `TrainerDifIR._degrade` (behaviour unchanged) so both share it.
+- `patch_restoration.py`: optional patch-based diffusive restoration following the idea of
+  [WeatherDiffusion](https://github.com/IGITUGraz/WeatherDiffusion) (MIT, Ozdenizci & Legenstein): model outputs are
+  averaged over overlapping patches at every reverse step. Re-implemented (not copied) as a wrapper model, so it works
+  with this repo's diffusion and `predict_type`s and extends to space-time patches; the grid always covers the borders.
+  Controlled by the `patch_restoration` block of `configs/vsr_DiT.yaml` (disabled by default).

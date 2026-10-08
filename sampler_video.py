@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sampler import BaseSampler
+from patch_restoration import get_patch_cfg, PatchDiffusiveRestoration
 from datapipe.video_datasets import VideoReader, find_videos, is_video_file, IMG_EXTS
 
 
@@ -46,7 +47,7 @@ class VideoSampler(BaseSampler):
             self, configs, sf=4, use_amp=True,
             chop_size=128, chop_stride=96,         # spatial tiles, in LQ pixels
             num_frames=None, frame_overlap=2,       # temporal window / overlap, in frames
-            padding_offset=64, seed=10000,
+            padding_offset=64, seed=10000, patch_restoration=None,
             ):
         if num_frames is None:
             num_frames = configs.get('data', {}).get('train', {}).get('params', {}).get('num_frames', 5)
@@ -56,6 +57,20 @@ class VideoSampler(BaseSampler):
         self.num_frames, self.frame_overlap = num_frames, frame_overlap
         super().__init__(configs, sf=sf, use_amp=use_amp, chop_size=chop_size, chop_stride=chop_stride,
                          padding_offset=padding_offset, seed=seed)
+        # optional WeatherDiff-style patch aggregation (config block `patch_restoration`, see patch_restoration.py)
+        self.patch_cfg = get_patch_cfg(configs)
+        if patch_restoration is not None:
+            self.patch_cfg['enabled'] = patch_restoration
+        self.patch_restorer = None
+        if self.patch_cfg['enabled']:
+            self._check_patch_cfg()
+            self.patch_restorer = PatchDiffusiveRestoration(self.base_diffusion, self.model, self.patch_cfg, sf=sf)
+
+    def _check_patch_cfg(self):
+        mp = self.configs.model.params
+        unit = mp.get('patch_size', 1) * 2 ** (len(mp.channel_mult) - 1) * mp.window_size
+        p = self.patch_cfg['patch_size']
+        assert p % unit == 0, f'patch_restoration.patch_size ({p}) must be a multiple of {unit} for this model'
 
     # ------------------------------------------------------------------ noise
     def _frame_noise(self, frame_idx, height, width, device):
@@ -73,6 +88,12 @@ class VideoSampler(BaseSampler):
         """
         _, _, T, h, w = lq.shape
         sf, dev = self.sf, lq.device
+        if self.patch_restorer is not None:
+            # one reverse process over the whole clip, model outputs averaged over overlapping patches per step
+            noise = torch.stack([self._frame_noise(i, h * sf, w * sf, dev) for i in frame_ids], dim=1)[None]
+            context = torch.cuda.amp.autocast if self.use_amp else nullcontext
+            with context():
+                return self.patch_restorer.restore(lq, noise=noise).float().clamp(-1, 1)
         ch = min(self.chop_size, h)
         cw = min(self.chop_size, w)
         stride = self.chop_stride
@@ -122,7 +143,7 @@ class VideoSampler(BaseSampler):
             lq = torch.from_numpy(np.stack(frames, 0)).permute(3, 0, 1, 2)[None].cuda()   # 1 x 3 x T x h x w
             lq = lq * 2 - 1
             off = self.padding_offset
-            ph, pw = (-h0) % off, (-w0) % off
+            ph, pw = ((-h0) % off, (-w0) % off) if self.patch_restorer is None else (0, 0)   # patch mode: any size
             if ph or pw:
                 lq = F.pad(lq.flatten(1, 2), (0, pw, 0, ph), mode='reflect').unflatten(1, (3, W))
             sr = self.sample_clip(lq, ids)[..., :h0 * self.sf, :w0 * self.sf]
