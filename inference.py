@@ -37,14 +37,9 @@ def get_configs(args):
         ckpt_dir.mkdir()
 
     if args.task == 'realsr':
-        if 'vqf8' in args.config_path:
-            vqgan_path = 'weights/vq_f8.ckpt'
-        else:
-            vqgan_path = ckpt_dir / f'autoencoder_vq_f4.pth'
         configs = OmegaConf.load(args.config_path)
         ckpt_path = args.ckpt_path
     elif args.task == 'faceir':
-        vqgan_path = ckpt_dir / f'ffhq512_vq_f8_dim8_face.pth'
         configs = OmegaConf.load(args.config_path)
         ckpt_path = args.ckpt_path
     else:
@@ -52,8 +47,6 @@ def get_configs(args):
 
     configs.model.ckpt_path = str(ckpt_path)
     configs.diffusion.params.sf = args.scale
-    if hasattr(configs, 'autoencoder'):
-        configs.autoencoder.ckpt_path = str(vqgan_path)
 
     if not Path(args.out_path).exists():
         Path(args.out_path).mkdir(parents=True)

@@ -47,7 +47,7 @@ pip install -r requirements.txt
 The training data comprises [LSDIR](https://huggingface.co/ofsoundof/LSDIR), [DIV2K](https://data.vision.ee.ethz.ch/cvl/DIV2K/), [DIV8K](https://ieeexplore.ieee.org/document/9021973), [OutdoorSceneTraining](https://mmlab.ie.cuhk.edu.hk/projects/SFTGAN/), [Flicker2K](https://www.kaggle.com/datasets/hliang001/flickr2k) and the first 10K face images from [FFHQ](https://github.com/NVlabs/ffhq-dataset). We saved all the image paths to ```txt``` files. For simplicity, you can also just use the LSDIR dataset.
 
 ### Pre-trained Models
-Several [checkpoints](https://drive.google.com/drive/folders/15EQYY3aKUKB9N3ec-AsXAZlhdCFzhT4R?usp=sharing) should be downloaded to ```weights``` folder, including autoencoder and other pre-trained models for loss calculation.
+Several [checkpoints](https://drive.google.com/drive/folders/15EQYY3aKUKB9N3ec-AsXAZlhdCFzhT4R?usp=sharing) should be downloaded to ```weights``` folder, including the pre-trained models for loss calculation (this fork runs in pixel space: no autoencoder is needed; upstream checkpoints are not compatible).
 
 ### Training Scripts
 **Real-world Image Super-resolution**

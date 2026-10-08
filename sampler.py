@@ -86,17 +86,6 @@ class BaseSampler:
         self.freeze_model(model)
         self.model = model.eval()
 
-        # autoencoder model
-        if self.configs.autoencoder is not None:
-            ckpt_path = self.configs.autoencoder.ckpt_path
-            assert ckpt_path is not None
-            self.write_log(f'Loading AutoEncoder model from {ckpt_path}...')
-            autoencoder = util_common.instantiate_from_config(self.configs.autoencoder).cuda()
-            self.load_model(autoencoder, ckpt_path)
-            autoencoder.eval()
-            self.autoencoder = autoencoder
-        else:
-            self.autoencoder = None
 
     def load_model(self, model, ckpt_path=None):
         state = torch.load(ckpt_path, map_location=f"cuda:{self.rank}")
@@ -143,14 +132,13 @@ class Sampler(BaseSampler):
         results = self.base_diffusion.p_sample_loop(
                 y=y0,
                 model=self.model,
-                first_stage_model=self.autoencoder,
                 noise=None,
                 noise_repeat=noise_repeat,
-                clip_denoised=(self.autoencoder is None),
+                clip_denoised=True,
                 denoised_fn=None,
                 model_kwargs=model_kwargs,
                 progress=False,
-                )    # This has included the decoding for latent space
+                )
 
         if flag_pad:
             results = results[:, :, :ori_h*self.sf, :ori_w*self.sf]

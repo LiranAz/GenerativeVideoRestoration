@@ -437,28 +437,6 @@ class TrainerDifIR(TrainerBase):
         if self.rank == 0 and hasattr(self.configs.train, 'ema_rate'):
             self.ema_ignore_keys.extend([x for x in self.ema_state.keys() if 'relative_position_index' in x])
 
-        # autoencoder
-        if self.configs.autoencoder is not None:
-            if self.rank == 0:
-                self.logger.info(f"Restoring autoencoder from {self.configs.autoencoder.ckpt_path}")
-            params = self.configs.autoencoder.get('params', dict)
-            autoencoder = util_common.get_obj_from_str(self.configs.autoencoder.target)(**params)
-            autoencoder.cuda()
-            util_net.load_model(autoencoder, self.configs.autoencoder.ckpt_path, self.rank)
-            
-
-            for params in autoencoder.parameters():
-                params.requires_grad_(False)
-            autoencoder.eval()
-            if self.configs.train.compile.flag:
-                if self.rank == 0:
-                    self.logger.info("Begin compiling autoencoder model...")
-                autoencoder = torch.compile(autoencoder, mode=self.configs.train.compile.mode)
-                if self.rank == 0:
-                    self.logger.info("Compiling Done")
-            self.autoencoder = autoencoder
-        else:
-            self.autoencoder = None
 
         # LPIPS metric
         lpips_loss = lpips.LPIPS(net='vgg').to(f"cuda:{self.rank}")
@@ -721,16 +699,6 @@ class TrainerDifIR(TrainerBase):
                     size=(micro_data['gt'].shape[0],),
                     device=f"cuda:{self.rank}",
                     )
-            latent_downsamping_sf = 2**(len(self.configs.autoencoder.params.ddconfig.ch_mult) - 1)
-            latent_resolution = micro_data['gt'].shape[-1] // latent_downsamping_sf
-            if 'autoencoder' in self.configs:
-                noise_chn = self.configs.autoencoder.params.embed_dim
-            else:
-                noise_chn = micro_data['gt'].shape[1]
-            noise = torch.randn(
-                    size= (micro_data['gt'].shape[0], noise_chn,) + (latent_resolution, ) * 2,
-                    device=micro_data['gt'].device,
-                    )
             if self.configs.model.params.cond_lq:
                 model_kwargs = {'lq':micro_data['lq'],}
                 if 'mask' in micro_data:
@@ -743,9 +711,7 @@ class TrainerDifIR(TrainerBase):
                 micro_data['gt'],
                 micro_data['lq'],
                 tt,
-                first_stage_model=self.autoencoder,
                 model_kwargs=model_kwargs,
-                noise=noise,
             )
             if last_batch or self.num_gpus <= 1:
                 losses, z0_pred, z_t = self.backward_step(compute_losses, micro_data, num_grad_accumulate, tt)
@@ -821,15 +787,9 @@ class TrainerDifIR(TrainerBase):
             if self.current_iters % self.configs.train.log_freq[1] == 0:
                 self.logging_image(batch['lq'], tag='lq', phase=phase, add_global_step=False)
                 self.logging_image(batch['gt'], tag='gt', phase=phase, add_global_step=False)
-                x_t = self.base_diffusion.decode_first_stage(
-                        self.base_diffusion._scale_input(z_t, tt),
-                        self.autoencoder,
-                        )
+                x_t = self.base_diffusion._scale_input(z_t, tt)
                 self.logging_image(x_t, tag='diffused', phase=phase, add_global_step=False)
-                x0_pred = self.base_diffusion.decode_first_stage(
-                        z0_pred,
-                        self.autoencoder,
-                        )
+                x0_pred = z0_pred
                 self.logging_image(x0_pred, tag='x0-pred', phase=phase, add_global_step=True)
 
             if self.current_iters % self.configs.train.save_freq == 1:
@@ -880,9 +840,8 @@ class TrainerDifIR(TrainerBase):
                 for sample in self.base_diffusion.p_sample_loop_progressive(
                         y=im_lq,
                         model=self.ema_model if self.configs.train.use_ema_val else self.model,
-                        first_stage_model=self.autoencoder,
                         noise=None,
-                        clip_denoised=True if self.autoencoder is None else False,
+                        clip_denoised=True,
                         model_kwargs=model_kwargs,
                         device=f"cuda:{self.rank}",
                         progress=False,
@@ -891,10 +850,7 @@ class TrainerDifIR(TrainerBase):
                     if num_iters in indices:
                         for key, value in sample.items():
                             if key in ['sample', ]:
-                                sample_decode[key] = self.base_diffusion.decode_first_stage(
-                                        value,
-                                        self.autoencoder,
-                                        ).clamp(-1.0, 1.0)
+                                sample_decode[key] = value.clamp(-1.0, 1.0)
                         im_sr_progress = sample_decode['sample']
                         if num_iters + 1 == 1:
                             im_sr_all = im_sr_progress
@@ -948,10 +904,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
         # diffusion loss
         with context():
             losses, z_t, z0_pred = dif_loss_wrapper()
-            x0_pred = self.base_diffusion.decode_first_stage(
-                    z0_pred,
-                    self.autoencoder,
-                    ) # f16
+            x0_pred = z0_pred # f16
             self.current_x0_pred = x0_pred.detach()
 
             # classification loss
@@ -1021,10 +974,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             if self.current_iters % self.configs.train.log_freq[1] == 0:
                 self.logging_image(batch['lq'], tag='lq', phase=phase, add_global_step=False)
                 self.logging_image(batch['gt'], tag='gt', phase=phase, add_global_step=False)
-                x_t = self.base_diffusion.decode_first_stage(
-                        self.base_diffusion._scale_input(z_t, tt),
-                        self.autoencoder,
-                        )
+                x_t = self.base_diffusion._scale_input(z_t, tt)
                 self.logging_image(x_t, tag='diffused', phase=phase, add_global_step=False)
                 self.logging_image(self.current_x0_pred, tag='x0-pred', phase=phase, add_global_step=True)
 
@@ -1052,30 +1002,6 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
         if self.rank == 0 and hasattr(self.configs.train, 'ema_rate'):
             self.ema_ignore_keys.extend([x for x in self.ema_state.keys() if 'relative_position_index' in x])
 
-        # autoencoder
-        if self.configs.autoencoder is not None:
-            # ckpt = torch.load(self.configs.autoencoder.ckpt_path, map_location=f"cuda:{self.rank}")
-            if self.rank == 0:
-                self.logger.info(f"Restoring autoencoder from {self.configs.autoencoder.ckpt_path}")
-            params = self.configs.autoencoder.get('params', dict)
-            autoencoder = util_common.get_obj_from_str(self.configs.autoencoder.target)(**params)
-            autoencoder.cuda()
-            # autoencoder.load_state_dict(ckpt, True)
-            util_net.load_model(autoencoder, self.configs.autoencoder.ckpt_path, self.rank)
-            
-
-            for params in autoencoder.parameters():
-                params.requires_grad_(False)
-            autoencoder.eval()
-            if self.configs.train.compile.flag:
-                if self.rank == 0:
-                    self.logger.info("Begin compiling autoencoder model...")
-                autoencoder = torch.compile(autoencoder, mode=self.configs.train.compile.mode)
-                if self.rank == 0:
-                    self.logger.info("Compiling Done")
-            self.autoencoder = autoencoder
-        else:
-            self.autoencoder = None
 
         # LPIPS metric
         lpips_loss = lpips.LPIPS(net='vgg').to(f"cuda:{self.rank}")
@@ -1338,16 +1264,6 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
                     size=(micro_data['gt'].shape[0],),
                     device=f"cuda:{self.rank}",
                     )
-            latent_downsamping_sf = 2**(len(self.configs.autoencoder.params.ddconfig.ch_mult) - 1)
-            latent_resolution = micro_data['gt'].shape[-1] // latent_downsamping_sf
-            if 'autoencoder' in self.configs:
-                noise_chn = self.configs.autoencoder.params.embed_dim
-            else:
-                noise_chn = micro_data['gt'].shape[1]
-            noise = torch.randn(
-                    size= (micro_data['gt'].shape[0], noise_chn,) + (latent_resolution, ) * 2,
-                    device=micro_data['gt'].device,
-                    )
             if self.configs.model.params.cond_lq:
                 model_kwargs = {'lq':micro_data['lq'],}
                 if 'mask' in micro_data:
@@ -1360,9 +1276,7 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
                 micro_data['gt'],
                 micro_data['lq'],
                 tt,
-                first_stage_model=self.autoencoder,
                 model_kwargs=model_kwargs,
-                noise=noise,
             )
             if last_batch or self.num_gpus <= 1:
                 losses, z0_pred, z_t = self.backward_step(compute_losses, micro_data, num_grad_accumulate, tt)
@@ -1438,15 +1352,9 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
             if self.current_iters % self.configs.train.log_freq[1] == 0:
                 self.logging_image(batch['lq'], tag='lq', phase=phase, add_global_step=False)
                 self.logging_image(batch['gt'], tag='gt', phase=phase, add_global_step=False)
-                x_t = self.base_diffusion.decode_first_stage(
-                        self.base_diffusion._scale_input(z_t, tt),
-                        self.autoencoder,
-                        )
+                x_t = self.base_diffusion._scale_input(z_t, tt)
                 self.logging_image(x_t, tag='diffused', phase=phase, add_global_step=False)
-                x0_pred = self.base_diffusion.decode_first_stage(
-                        z0_pred,
-                        self.autoencoder,
-                        )
+                x0_pred = z0_pred
                 self.logging_image(x0_pred, tag='x0-pred', phase=phase, add_global_step=True)
 
             if self.current_iters % self.configs.train.save_freq == 1:
@@ -1497,9 +1405,8 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
                 for sample in self.base_diffusion.p_sample_loop_progressive(
                         y=im_lq,
                         model=self.ema_model if self.configs.train.use_ema_val else self.model,
-                        first_stage_model=self.autoencoder,
                         noise=None,
-                        clip_denoised=True if self.autoencoder is None else False,
+                        clip_denoised=True,
                         model_kwargs=model_kwargs,
                         device=f"cuda:{self.rank}",
                         progress=False,
@@ -1508,10 +1415,7 @@ class TrainerDifIR_DiffBIRDataset(TrainerBase):
                     if num_iters in indices:
                         for key, value in sample.items():
                             if key in ['sample', ]:
-                                sample_decode[key] = self.base_diffusion.decode_first_stage(
-                                        value,
-                                        self.autoencoder,
-                                        ).clamp(-1.0, 1.0)
+                                sample_decode[key] = value.clamp(-1.0, 1.0)
                         im_sr_progress = sample_decode['sample']
                         if num_iters + 1 == 1:
                             im_sr_all = im_sr_progress

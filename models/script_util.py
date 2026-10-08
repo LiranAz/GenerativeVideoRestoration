@@ -18,7 +18,7 @@ def create_gaussian_diffusion(
     predict_type='xstart',
     timestep_respacing=None,
     scale_factor=None,
-    latent_flag=True,
+    latent_flag=False,
 ):
     sqrt_etas = gd.get_named_eta_schedule(
             schedule_name,

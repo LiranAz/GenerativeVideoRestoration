@@ -130,6 +130,10 @@ class DiTSRModel(nn.Module):
                                a fixed channel width per attention head.
     :param use_new_attention_order: use a different attention pattern for potentially
                                     increased efficiency.
+    :param patch_size: pixel-unshuffle factor for pixel-space operation. The input is folded from
+        [C x H x W] to [C*p^2 x H/p x W/p] before the UNet and the output is shuffled back, so the UNet
+        works at `image_size = H / p` (this is what a p-times-downsampling autoencoder used to provide).
+        The LQ condition is bicubic-resized to the size of x and folded the same way.
     :patch_norm: patch normalization in swin transformer
     :swin_embed_norm: embed_dim in swin transformer
     """
@@ -159,6 +163,7 @@ class DiTSRModel(nn.Module):
         lq_channels=None,
         swin_attn_type='AdaLN',
         temporal_attn=True,
+        patch_size=1,
         **kwargs,
     ):
         super().__init__()
@@ -180,6 +185,7 @@ class DiTSRModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.cond_lq = cond_lq
         self.cond_mask = cond_mask
+        self.patch_size = patch_size
 
         time_embed_dim = model_channels * 4         # 640 = 160 * 4 
         self.time_embed = nn.Sequential(
@@ -188,9 +194,9 @@ class DiTSRModel(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
 
-        if cond_lq and lq_size == image_size: 
+        if cond_lq and (lq_size == image_size or patch_size > 1):
             self.feature_extractor = nn.Identity()
-            base_chn = 4 if cond_mask else 3    # lq_channel
+            base_chn = (4 if cond_mask else 3) * patch_size ** 2    # lq_channel
             base_chn = lq_channels if lq_channels else base_chn
         else:
             feature_extractor = []
@@ -206,7 +212,8 @@ class DiTSRModel(nn.Module):
             self.feature_extractor = nn.Sequential(*feature_extractor)
 
         ch = input_ch = int(channel_mult[0] * model_channels)   # 160 * 1
-        in_channels += base_chn     # 6 = 3+3
+        in_channels = in_channels * patch_size ** 2 + base_chn     # e.g. 3*16 + 3*16 for p=4
+        out_channels = out_channels * patch_size ** 2
         self.unet_in_channels = in_channels #   save for calculate flops     
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
@@ -367,6 +374,17 @@ class DiTSRModel(nn.Module):
             assert T_lq == T, f"lq has {T_lq} frames but x has {T}"
         if mask is not None:
             mask, _ = frames_to_batch(mask)
+        p = self.patch_size
+        if p > 1:
+            # pixel space: bring the condition onto x's pixel grid, then fold p x p pixels into channels
+            size = x.shape[-2:]
+            if lq is not None and lq.shape[-2:] != size:
+                lq = F.interpolate(lq, size=size, mode='bicubic')
+            if mask is not None and mask.shape[-2:] != size:
+                mask = F.interpolate(mask, size=size, mode='nearest')
+            x = F.pixel_unshuffle(x, p)
+            lq = F.pixel_unshuffle(lq, p) if lq is not None else None
+            mask = F.pixel_unshuffle(mask, p) if mask is not None else None
 
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels)).type(self.dtype)
@@ -391,4 +409,6 @@ class DiTSRModel(nn.Module):
             h = module(h, emb, T)
         h = h.type(x.dtype)
         out = self.out(h)
+        if p > 1:
+            out = F.pixel_shuffle(out, p)
         return batch_to_frames(out, T, is_video)

@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from .basic_ops import mean_flat, frames_to_batch, batch_to_frames
 from .losses import normal_kl, discretized_gaussian_log_likelihood
 
-from ldm.models.autoencoder import AutoencoderKLTorch
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, beta_start, beta_end):
     """
@@ -129,7 +128,7 @@ class GaussianDiffusion:
         sf=4,
         scale_factor=None,
         normalize_input=True,
-        latent_flag=True,
+        latent_flag=False,
     ):
         self.kappa = kappa
         self.model_mean_type = model_mean_type
@@ -368,8 +367,6 @@ class GaussianDiffusion:
         self,
         y,
         model,
-        first_stage_model=None,
-        consistencydecoder=None,
         noise=None,
         noise_repeat=False,
         clip_denoised=True,
@@ -383,7 +380,6 @@ class GaussianDiffusion:
 
         :param y: the [N x C x ...] tensor of degraded inputs.
         :param model: the model module.
-        :param first_stage_model: the autoencoder model
         :param noise: if specified, the noise from the encoder to sample.
                       Should be of the same shape as `shape`.
         :param clip_denoised: if True, clip x_start predictions to [-1, 1].
@@ -400,7 +396,6 @@ class GaussianDiffusion:
         for sample in self.p_sample_loop_progressive(
             y,
             model,
-            first_stage_model=first_stage_model,
             noise=noise,
             noise_repeat=noise_repeat,
             clip_denoised=clip_denoised,
@@ -410,17 +405,10 @@ class GaussianDiffusion:
             progress=progress,
         ):
             final = sample["sample"]
-        with th.no_grad():
-            out = self.decode_first_stage(
-                    final,
-                    first_stage_model=first_stage_model,
-                    consistencydecoder=consistencydecoder,
-                    )
-        return out
+        return final
 
     def p_sample_loop_progressive(
             self, y, model,
-            first_stage_model=None,
             noise=None,
             noise_repeat=False,
             clip_denoised=True,
@@ -439,13 +427,13 @@ class GaussianDiffusion:
         """
         if device is None:
             device = next(model.parameters()).device
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+        z_y = self.upsample_lq(y)
 
         # generating noise
         if noise is None:
             noise = th.randn_like(z_y)
         if noise_repeat:
-            noise = noise[0,].repeat(z_y.shape[0], 1, 1, 1)
+            noise = noise[:1].repeat(z_y.shape[0], *([1] * (noise.ndim - 1)))
         z_sample = self.prior_sample(z_y, noise)
 
         indices = list(range(self.num_timesteps))[::-1]
@@ -471,53 +459,17 @@ class GaussianDiffusion:
                 yield out
                 z_sample = out["sample"]
 
-    def decode_first_stage(self, z_sample, first_stage_model=None, consistencydecoder=None):
-        batch_size = z_sample.shape[0]
-        data_dtype = z_sample.dtype
-        is_video = z_sample.ndim == 5
-        z_sample, T = frames_to_batch(z_sample)
-
-        if consistencydecoder is None:
-            model = first_stage_model
-            decoder = first_stage_model.decode
-            model_dtype = next(model.parameters()).dtype
-        else:
-            model = consistencydecoder
-            decoder = consistencydecoder
-            model_dtype = next(model.ckpt.parameters()).dtype
-
-        if first_stage_model is None:
-            return batch_to_frames(z_sample, T, is_video)
-        else:
-            z_sample = 1 / self.scale_factor * z_sample
-            if consistencydecoder is None:
-                out = decoder(z_sample.type(model_dtype))
-            else:
-                with th.cuda.amp.autocast():
-                    out = decoder(z_sample)
-            if not model_dtype == data_dtype:
-                out = out.type(data_dtype)
-            return batch_to_frames(out, T, is_video)
-
-    def encode_first_stage(self, y, first_stage_model, up_sample=False):
-        data_dtype = y.dtype
-        # the first stage is a 2-D autoencoder: [B x C x T x H x W] inputs are folded to [B*T x C x H x W]
+    def upsample_lq(self, y):
+        """
+        Bicubic-upsample the low-quality input by `sf` so that it lives on the same pixel grid as x.
+        Accepts [N x C x H x W] or [N x C x T x H x W] (frames are resized independently).
+        """
+        if self.sf == 1:
+            return y
         is_video = y.ndim == 5
         y, T = frames_to_batch(y)
-        if up_sample and self.sf != 1:
-            y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
-        if first_stage_model is None:
-            return batch_to_frames(y, T, is_video)
-        else:
-            model_dtype = next(first_stage_model.parameters()).dtype
-            if not model_dtype == data_dtype:
-                y = y.type(model_dtype)
-            with th.no_grad():
-                z_y = first_stage_model.encode(y)
-                out = z_y * self.scale_factor
-            if not model_dtype == data_dtype:
-                out = out.type(data_dtype)
-            return batch_to_frames(out, T, is_video)
+        y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
+        return batch_to_frames(y, T, is_video)
 
     def prior_sample(self, y, noise=None):
         """
@@ -535,7 +487,6 @@ class GaussianDiffusion:
 
     def training_losses(
             self, model, x_start, y, t,
-            first_stage_model=None,
             model_kwargs=None,
             noise=None,
             ):
@@ -543,7 +494,6 @@ class GaussianDiffusion:
         Compute training losses for a single timestep.
 
         :param model: the model to evaluate loss on.
-        :param first_stage_model: autoencoder model
         :param x_start: the [N x C x ...] tensor of inputs.
         :param y: the [N x C x ...] tensor of degraded inputs.
         :param t: a batch of timestep indices.
@@ -557,8 +507,8 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
-        z_start = self.encode_first_stage(x_start, first_stage_model, up_sample=False)
+        z_y = self.upsample_lq(y)
+        z_start = x_start
 
         if noise is None:
             noise = th.randn_like(z_start)
@@ -903,7 +853,6 @@ class GaussianDiffusionDDPM:
         noise=None,
         clip_denoised=True,
         denoised_fn=None,
-        first_stage_model=None,
         model_kwargs=None,
         device=None,
         progress=False,
@@ -937,7 +886,7 @@ class GaussianDiffusionDDPM:
             progress=progress,
         ):
             final = sample
-        return self.decode_first_stage(final["sample"], first_stage_model)
+        return final["sample"]
 
     def p_sample_loop_progressive(
         self,
@@ -1075,7 +1024,6 @@ class GaussianDiffusionDDPM:
         model,
         shape,
         noise=None,
-        first_stage_model=None,
         clip_denoised=True,
         denoised_fn=None,
         model_kwargs=None,
@@ -1101,7 +1049,7 @@ class GaussianDiffusionDDPM:
             eta=eta,
         ):
             final = sample
-        return self.decode_first_stage(final["sample"], first_stage_model)
+        return final["sample"]
 
     def ddim_sample_loop_progressive(
         self,
@@ -1151,7 +1099,7 @@ class GaussianDiffusionDDPM:
                 yield out
                 img = out["sample"]
 
-    def training_losses(self, model, x_start, t, first_stage_model=None, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
@@ -1167,7 +1115,7 @@ class GaussianDiffusionDDPM:
         if model_kwargs is None:
             model_kwargs = {}
 
-        z_start = self.encode_first_stage(x_start, first_stage_model)
+        z_start = x_start
         if noise is None:
             noise = th.randn_like(z_start)
         z_t = self.q_sample(z_start, t, noise=noise)
@@ -1217,32 +1165,3 @@ class GaussianDiffusionDDPM:
 
     def _scale_input(self, inputs, t):
         return inputs
-
-    def decode_first_stage(self, z_sample, first_stage_model=None):
-        ori_dtype = z_sample.dtype
-        is_video = z_sample.ndim == 5
-        z_sample, T = frames_to_batch(z_sample)
-        if first_stage_model is None:
-            return batch_to_frames(z_sample, T, is_video)
-        else:
-            with th.no_grad():
-                z_sample = 1 / self.scale_factor * z_sample
-                z_sample = z_sample.type(next(first_stage_model.parameters()).dtype)
-                out = first_stage_model.decode(z_sample)
-                return batch_to_frames(out.type(ori_dtype), T, is_video)
-
-    def encode_first_stage(self, y, first_stage_model, up_sample=False):
-        ori_dtype = y.dtype
-        is_video = y.ndim == 5
-        y, T = frames_to_batch(y)
-        if up_sample:
-            y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
-        if first_stage_model is None:
-            return batch_to_frames(y, T, is_video)
-        else:
-            with th.no_grad():
-                y = y.type(dtype=next(first_stage_model.parameters()).dtype)
-                z_y = first_stage_model.encode(y)
-                out = z_y * self.scale_factor
-                return batch_to_frames(out.type(ori_dtype), T, is_video)
-

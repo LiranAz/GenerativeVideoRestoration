@@ -5,7 +5,8 @@ model:
   target: models.unet.DiTSRModel
   ckpt_path: ~
   params:
-    image_size: 64
+    image_size: 64   # resolution the UNet works at, i.e. pixel size / patch_size
+    patch_size: 4    # pixel-unshuffle factor: pixel-space input is folded to image_size x image_size before the UNet
     in_channels: 3
     model_channels: 128
     out_channels: 3
@@ -39,30 +40,7 @@ diffusion:
     timestep_respacing: ~
     scale_factor: 1.0
     normalize_input: True
-    latent_flag: True
-
-autoencoder:
-  target: ldm.models.autoencoder.VQModelTorch
-  ckpt_path: weights/autoencoder_vq_f4.pth
-  use_fp16: True
-  params:
-    embed_dim: 3
-    n_embed: 8192
-    ddconfig:
-      double_z: False
-      z_channels: 3
-      resolution: 256
-      in_channels: 3
-      out_ch: 3
-      ch: 128
-      ch_mult:
-      - 1
-      - 2
-      - 4
-      num_res_blocks: 2
-      attn_resolutions: []
-      dropout: 0.0
-      padding_mode: zeros
+    latent_flag: False
 
 degradation:
   sf: 4
