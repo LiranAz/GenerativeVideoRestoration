@@ -404,7 +404,9 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
         Args:
             x: (B*T) x C x Ph x Pw, Ph = H // patch_size; frames are folded into the batch axis
             t: (B*T) x emb_channels timestep embedding
-            num_frames: T. Temporal attention is skipped when T == 1
+            num_frames: T. The temporal branch also runs for T == 1 (attention over a single frame reduces to a
+                value/output projection), so its parameters always take part in the graph (DDP) and a model trained
+                on clips or on single images behaves the same way for every T
         Out:
             x: B x (H*W) x C
         '''
@@ -447,7 +449,7 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
         x = shortcut + self.drop_path(gate_msa * x)
 
         # temporal attention across frames
-        if self.temporal_attn and num_frames > 1:
+        if self.temporal_attn:
             shift_t, scale_t, gate_t = mod[6:]
             x = x + self.drop_path(gate_t * self.attn_t(self.norm_t(x) * (1 + scale_t) + shift_t, num_frames))
 

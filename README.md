@@ -23,7 +23,9 @@ Details:
 - **Video model.** Frames are folded into the batch for all per-frame layers (convs, window attention, MLP). Each Swin
   block adds a temporal attention branch that attends across the T frames at every spatial position, with a sinusoidal
   frame-index embedding, so any T works at inference. The temporal gate starts at zero: at initialisation a video behaves
-  exactly like per-frame image SR. `temporal_attn: False` in the model params disables it.
+  exactly like per-frame image SR. `temporal_attn: False` in the model params disables it. The temporal branch also runs for `T=1` (single frames/images),
+  where attention over one frame reduces to a value/output projection; this keeps all parameters in the graph, so training
+  with `num_frames: 1` (or on single images) also works with multi-GPU DDP, and every `T` uses the same code path.
 - **Pixel space.** To keep the compute of the old latent UNet, `DiTSRModel(patch_size=p)` pixel-unshuffles the input into
   channels (`p=4` for real-world SR, `p=8` for faces), runs the UNet at `image_size = H/p`, and shuffles the output back.
   The low-quality condition is bicubic-resized to the size of `x` inside the model.

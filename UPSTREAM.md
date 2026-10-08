@@ -31,3 +31,5 @@ or relying on this code beyond research use. The original README is kept unchang
   averaged over overlapping patches at every reverse step. Re-implemented (not copied) as a wrapper model, so it works
   with this repo's diffusion and `predict_type`s and extends to space-time patches; the grid always covers the borders.
   Controlled by the `patch_restoration` block of `configs/vsr_DiT.yaml` (disabled by default).
+- The temporal branch is also applied when `T == 1` (4-D image input or 1-frame clips) so its parameters are always used (DDP)
+  and one code path serves every `T`; at initialisation it is still switched off by the zero gate.

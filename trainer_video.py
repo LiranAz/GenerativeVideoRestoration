@@ -7,7 +7,6 @@ Differences to trainer.TrainerDifIR (which it extends):
   * validation samples whole clips and reports per-frame PSNR / LPIPS.
 """
 import math
-import warnings
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -22,10 +21,6 @@ class TrainerDifVSR(TrainerDifIR):
     def __init__(self, configs):
         resolve_crop(configs)    # derive/validate everything that depends on degradation.gt_size
         super().__init__(configs)
-        if self.num_gpus > 1 and configs.data.train.params.get('num_frames', 2) < 2 \
-                and configs.model.params.get('temporal_attn', True):
-            warnings.warn('num_frames < 2 never uses the temporal-attention parameters; DDP will fail with '
-                          '"parameters not used in the loss". Set model.params.temporal_attn: False or num_frames >= 2.')
 
     # ------------------------------------------------------------------ data
     @torch.no_grad()
