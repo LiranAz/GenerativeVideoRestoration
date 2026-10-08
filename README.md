@@ -110,6 +110,15 @@ Long videos are handled with sliding temporal windows (`--num_frames`, `--frame_
 weights, and the initial noise of every frame depends only on the seed, the frame index and the pixel position, so
 overlapping windows and tiles start from identical noise and agree with each other.
 
+### Evaluate
+```
+python evaluate_video.py -i results/ -r gt_videos/ --metrics psnr,ssim,tde --out_json metrics.json
+```
+Restored and ground-truth videos (files, frame folders, or folders of them) are paired by name. Metrics are computed per
+frame on the Y channel (8-bit) and averaged: `psnr`, `ssim`, `lpips` (needs the LPIPS weights) and `tde`, the
+*temporal difference error* `mean |(SR_{t+1}-SR_t) - (GT_{t+1}-GT_t)|`, which grows with flicker and temporal drift.
+`evaluate.py` is the upstream image-only script (no-reference metrics via `pyiqa`, needs a GPU and downloads weights).
+
 ### Optional: WeatherDiff-style patch-based restoration
 Instead of restoring tiles independently, the whole clip can be restored in **one** reverse process in which, at every
 step, the model is applied to overlapping space-time patches of the current `x_t`, the outputs are averaged per pixel and
@@ -172,6 +181,7 @@ trainer.py                  image trainers (Real-ESRGAN degradation in TrainerDi
 trainer_video.py            TrainerDifVSR: video training and validation
 sampler.py / inference.py   image sampler and CLI
 sampler_video.py / inference_video.py   windowed + tiled video sampler and CLI
+evaluate_video.py           PSNR / SSIM / LPIPS / temporal-difference error for videos
 patch_restoration.py        optional WeatherDiff-style per-step patch aggregation
 configs/                    vsr_DiT.yaml (video), realsr_*.yaml, faceir_DiT.yaml
 ```

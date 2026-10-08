@@ -50,6 +50,7 @@ def evaluate(in_path, ref_path, ntest):
                 result[key] = result.get(key, 0) + metric(im_in_tensor).item()
     
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    Path('results').mkdir(exist_ok=True)
     with open('results/log.txt', 'a') as file:
         file.write(f"\n[{current_time}]: {in_path}\n")
         for key, res in result.items():
