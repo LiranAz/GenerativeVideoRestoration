@@ -23,6 +23,8 @@ from .basic_ops import (
     avg_pool_nd,
     normalization,
     timestep_embedding,
+    frames_to_batch,
+    batch_to_frames,
 )
 from .swin_transformer import BasicLayer, TimestepBlock
 
@@ -40,10 +42,10 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, num_frames=1):
         for layer in self:
             if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
+                x = layer(x, emb, num_frames)
             else:
                 x = layer(x)
         return x
@@ -156,9 +158,11 @@ class DiTSRModel(nn.Module):
         lq_size=256,
         lq_channels=None,
         swin_attn_type='AdaLN',
+        temporal_attn=True,
         **kwargs,
     ):
         super().__init__()
+        kwargs['temporal_attn'] = temporal_attn
 
         if num_heads == -1:
             assert swin_embed_dim % num_head_channels == 0 and num_head_channels > 0
@@ -347,14 +351,27 @@ class DiTSRModel(nn.Module):
 
     def forward(self, x, timesteps, lq=None, mask=None):
         """
-        Apply the model to an input batch.
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param lq: an [N x C x ...] Tensor of low quality iamge.
-        :return: an [N x C x ...] Tensor of outputs.
+        Apply the model to an input batch of images or videos.
+        Per-frame layers (convs, window attention, MLP) see the frames folded into the batch axis; temporal
+        attention inside the swin blocks mixes information across frames.
+        :param x: an [N x C x H x W] image or an [N x C x T x H x W] video Tensor.
+        :param timesteps: a 1-D batch of N timesteps (shared by all frames of a video).
+        :param lq: a Tensor of the low quality input, same layout as x (before any lq downsampling).
+        :param mask: optional Tensor, same layout as lq.
+        :return: a Tensor with the same layout as x.
         """
+        is_video = x.ndim == 5
+        x, T = frames_to_batch(x)
+        if lq is not None:
+            lq, T_lq = frames_to_batch(lq)
+            assert T_lq == T, f"lq has {T_lq} frames but x has {T}"
+        if mask is not None:
+            mask, _ = frames_to_batch(mask)
+
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels)).type(self.dtype)
+        if T > 1:
+            emb = emb.repeat_interleave(T, dim=0)    # same order as the (B, T) -> B*T fold
 
         if lq is not None:
             assert self.cond_lq
@@ -366,12 +383,12 @@ class DiTSRModel(nn.Module):
 
         h = x.type(self.dtype)
         for ii, module in enumerate(self.input_blocks):
-            h = module(h, emb)
+            h = module(h, emb, T)
             hs.append(h)
-        h = self.middle_block(h, emb)
+        h = self.middle_block(h, emb, T)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
+            h = module(h, emb, T)
         h = h.type(x.dtype)
         out = self.out(h)
-        return out
+        return batch_to_frames(out, T, is_video)

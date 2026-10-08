@@ -116,3 +116,24 @@ def timestep_embedding(timesteps, dim, max_period=10000):
         embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
 
+
+
+def frames_to_batch(x):
+    """
+    [B x C x T x H x W] -> ([B*T x C x H x W], T). 4-D inputs pass through with T = 1.
+    """
+    if x.ndim == 4:
+        return x, 1
+    assert x.ndim == 5, f"expected a 4-D or 5-D tensor, got shape {tuple(x.shape)}"
+    B, C, T, H, W = x.shape
+    return x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W), T
+
+
+def batch_to_frames(x, num_frames, is_video):
+    """
+    Inverse of frames_to_batch: [B*T x C x H x W] -> [B x C x T x H x W] if is_video else unchanged.
+    """
+    if not is_video:
+        return x
+    BT, C, H, W = x.shape
+    return x.reshape(BT // num_frames, num_frames, C, H, W).permute(0, 2, 1, 3, 4)

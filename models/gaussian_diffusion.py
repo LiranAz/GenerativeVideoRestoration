@@ -6,7 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 
-from .basic_ops import mean_flat
+from .basic_ops import mean_flat, frames_to_batch, batch_to_frames
 from .losses import normal_kl, discretized_gaussian_log_likelihood
 
 from ldm.models.autoencoder import AutoencoderKLTorch
@@ -474,6 +474,8 @@ class GaussianDiffusion:
     def decode_first_stage(self, z_sample, first_stage_model=None, consistencydecoder=None):
         batch_size = z_sample.shape[0]
         data_dtype = z_sample.dtype
+        is_video = z_sample.ndim == 5
+        z_sample, T = frames_to_batch(z_sample)
 
         if consistencydecoder is None:
             model = first_stage_model
@@ -485,7 +487,7 @@ class GaussianDiffusion:
             model_dtype = next(model.ckpt.parameters()).dtype
 
         if first_stage_model is None:
-            return z_sample
+            return batch_to_frames(z_sample, T, is_video)
         else:
             z_sample = 1 / self.scale_factor * z_sample
             if consistencydecoder is None:
@@ -495,16 +497,19 @@ class GaussianDiffusion:
                     out = decoder(z_sample)
             if not model_dtype == data_dtype:
                 out = out.type(data_dtype)
-            return out
+            return batch_to_frames(out, T, is_video)
 
     def encode_first_stage(self, y, first_stage_model, up_sample=False):
         data_dtype = y.dtype
-        model_dtype = next(first_stage_model.parameters()).dtype
+        # the first stage is a 2-D autoencoder: [B x C x T x H x W] inputs are folded to [B*T x C x H x W]
+        is_video = y.ndim == 5
+        y, T = frames_to_batch(y)
         if up_sample and self.sf != 1:
             y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
         if first_stage_model is None:
-            return y
+            return batch_to_frames(y, T, is_video)
         else:
+            model_dtype = next(first_stage_model.parameters()).dtype
             if not model_dtype == data_dtype:
                 y = y.type(model_dtype)
             with th.no_grad():
@@ -512,7 +517,7 @@ class GaussianDiffusion:
                 out = z_y * self.scale_factor
             if not model_dtype == data_dtype:
                 out = out.type(data_dtype)
-            return out
+            return batch_to_frames(out, T, is_video)
 
     def prior_sample(self, y, noise=None):
         """
@@ -1215,25 +1220,29 @@ class GaussianDiffusionDDPM:
 
     def decode_first_stage(self, z_sample, first_stage_model=None):
         ori_dtype = z_sample.dtype
+        is_video = z_sample.ndim == 5
+        z_sample, T = frames_to_batch(z_sample)
         if first_stage_model is None:
-            return z_sample
+            return batch_to_frames(z_sample, T, is_video)
         else:
             with th.no_grad():
                 z_sample = 1 / self.scale_factor * z_sample
                 z_sample = z_sample.type(next(first_stage_model.parameters()).dtype)
                 out = first_stage_model.decode(z_sample)
-                return out.type(ori_dtype)
+                return batch_to_frames(out.type(ori_dtype), T, is_video)
 
     def encode_first_stage(self, y, first_stage_model, up_sample=False):
         ori_dtype = y.dtype
+        is_video = y.ndim == 5
+        y, T = frames_to_batch(y)
         if up_sample:
             y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
         if first_stage_model is None:
-            return y
+            return batch_to_frames(y, T, is_video)
         else:
             with th.no_grad():
                 y = y.type(dtype=next(first_stage_model.parameters()).dtype)
                 z_y = first_stage_model.encode(y)
                 out = z_y * self.scale_factor
-                return out.type(ori_dtype)
+                return batch_to_frames(out.type(ori_dtype), T, is_video)
 

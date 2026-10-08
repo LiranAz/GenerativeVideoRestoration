@@ -13,3 +13,9 @@ or relying on this code beyond research use. The original README is kept unchang
   per-channel shift/scale/gate from the timestep embedding, zero-initialised so each block starts as identity).
   Block renamed `SwinTransformerBlock_AdaLNZero`. **Upstream pretrained checkpoints are not compatible**
   (`adaLN_scale_*` keys replaced by `adaLN_modulation`), so models must be trained from scratch.
+- Video input: `DiTSRModel` (and `GaussianDiffusion.encode/decode_first_stage`) accept `[B, C, T, H, W]` as well as
+  `[B, C, H, W]`. Frames are folded into the batch for all per-frame layers; each Swin block gains a
+  temporal self-attention branch (across T at every spatial location, sinusoidal frame-index embedding, adaLN-Zero
+  gated) so any T works. At init the temporal branch is off, so a video behaves like per-frame image SR.
+  `temporal_attn: False` in the model params disables it. Not yet done: video dataloader, degradation pipeline
+  and trainer/inference scripts are still image-only.

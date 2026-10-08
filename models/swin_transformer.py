@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from abc import abstractmethod
-from .basic_ops import normalization
+from .basic_ops import normalization, timestep_embedding
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 
@@ -29,9 +29,10 @@ class TimestepBlock(nn.Module):
     """
 
     @abstractmethod
-    def forward(self, x, emb):
+    def forward(self, x, emb, num_frames=1):
         """
-        Apply the module to `x` given `emb` timestep embeddings.
+        Apply the module to `x` given `emb` timestep embeddings. Frames are folded into the batch
+        axis of `x` (B*T x C x H x W); `num_frames` is T.
         """
 
 
@@ -280,6 +281,34 @@ class PatchUnEmbed(nn.Module):
         return x
  
 
+class TemporalAttention(nn.Module):
+    """Multi-head self-attention across the frame axis, independently at every spatial location.
+
+    Frames are stored folded into the batch (B*T x C x H x W); T is passed in explicitly. A sinusoidal
+    frame-index embedding is added to the tokens, so any number of frames can be used at inference.
+    """
+    def __init__(self, dim, num_heads, qkv_bias=True):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, num_frames):
+        BT, C, H, W = x.shape
+        B = BT // num_frames
+        # (B*T) x C x H x W -> (B*H*W) x T x C
+        x = x.reshape(B, num_frames, C, H * W).permute(0, 3, 1, 2).reshape(B * H * W, num_frames, C)
+        pos = timestep_embedding(torch.arange(num_frames, device=x.device), C).to(x.dtype)
+        x = x + pos[None]
+        qkv = self.qkv(x).reshape(B * H * W, num_frames, 3, self.num_heads, C // self.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each: (B*H*W) x heads x T x head_dim
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = self.proj(x.transpose(1, 2).reshape(B * H * W, num_frames, C))
+        return x.reshape(B, H * W, num_frames, C).permute(0, 2, 3, 1).reshape(BT, C, H, W)
+
+
 class SwinTransformerBlock_AdaLNZero(nn.Module):
     r""" Swin Transformer Block.
 
@@ -300,7 +329,7 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
     """
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=normalization, emb_channels=160*4, **kwargs):
+                 act_layer=nn.GELU, norm_layer=normalization, emb_channels=160*4, temporal_attn=True, **kwargs):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -331,12 +360,18 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-        # adaLN-Zero: shift/scale/gate for both the attention and the MLP branch, predicted from the
-        # timestep embedding. Zero-init makes every block an identity mapping at the start of training.
+        # adaLN-Zero: shift/scale/gate for the spatial-attention, temporal-attention and MLP branches,
+        # predicted from the timestep embedding. Zero-init makes every block an identity mapping at the
+        # start of training (so the temporal branch starts switched off, i.e. a per-frame image model).
+        self.temporal_attn = temporal_attn
+        self.n_mod = 9 if temporal_attn else 6
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(emb_channels, 6 * dim)
+            nn.Linear(emb_channels, self.n_mod * dim)
         )
+        if temporal_attn:
+            self.norm_t = norm_layer(dim)
+            self.attn_t = TemporalAttention(dim, num_heads, qkv_bias=qkv_bias)
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
@@ -364,10 +399,12 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, t):
+    def forward(self, x, t, num_frames=1):
         '''
         Args:
-            x: B x C x Ph x Pw, Ph = H // patch_size
+            x: (B*T) x C x Ph x Pw, Ph = H // patch_size; frames are folded into the batch axis
+            t: (B*T) x emb_channels timestep embedding
+            num_frames: T. Temporal attention is skipped when T == 1
         Out:
             x: B x (H*W) x C
         '''
@@ -375,8 +412,8 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
         x_size = (Ph, Pw)
         x_type = x.dtype
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(t)[:, :, None, None].chunk(6, dim=1)  # each B x C x 1 x 1
+        mod = self.adaLN_modulation(t)[:, :, None, None].chunk(self.n_mod, dim=1)  # each (B*T) x C x 1 x 1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod[:6]
 
         shortcut = x
         x = self.norm1(x) * (1 + scale_msa) + shift_msa
@@ -408,6 +445,11 @@ class SwinTransformerBlock_AdaLNZero(nn.Module):
             x = shifted_x
 
         x = shortcut + self.drop_path(gate_msa * x)
+
+        # temporal attention across frames
+        if self.temporal_attn and num_frames > 1:
+            shift_t, scale_t, gate_t = mod[6:]
+            x = x + self.drop_path(gate_t * self.attn_t(self.norm_t(x) * (1 + scale_t) + shift_t, num_frames))
 
         shortcut = x
         x = self.norm2(x) * (1 + scale_mlp) + shift_mlp
@@ -503,10 +545,11 @@ class BasicLayer(TimestepBlock):
                                  )
             for i in range(depth)])
 
-    def forward(self, x, t):
+    def forward(self, x, t, num_frames=1):
         '''
         Args:
-            x: B x C x H x W, H,W: height and width after patch embedding
+            x: (B*T) x C x H x W, H,W: height and width after patch embedding; frames folded into batch
+            num_frames: T
             x_size: (H, W)
         Out:
             x: B x H x W x C
@@ -514,8 +557,8 @@ class BasicLayer(TimestepBlock):
         x = self.patch_embed(x) if self.patch_emb else x # B x embed_dim x Ph x Pw
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, t)
+                x = checkpoint.checkpoint(blk, x, t, num_frames)
             else:
-                x = blk(x, t)
+                x = blk(x, t, num_frames)
         x = self.patch_unembed(x) if self.patch_emb else x # B x C x Ph x Pw
         return x
