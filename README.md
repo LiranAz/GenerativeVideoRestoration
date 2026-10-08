@@ -93,3 +93,24 @@ If you find our work useful in your research, please consider citing:
 
 ## ❤️ Acknowledgement
 We sincerely appreciate the code release of the following projects: [ResShift](https://github.com/zsyOAOA/ResShift), [DiT](https://github.com/facebookresearch/DiT), [FFTFormer](https://github.com/kkkls/FFTformer), [SwinIR](https://github.com/JingyunLiang/SwinIR), [SinSR](https://github.com/wyf0912/SinSR), and [BasicSR](https://github.com/XPixelGroup/BasicSR).
+
+## 🎞️ Video restoration (this fork)
+
+Pixel-space diffusion with temporal attention; the model maps `[B,3,T,H,W]` -> `[B,3,T,H,W]` (see `UPSTREAM.md`).
+
+**Data.** A video is a folder of frames or a video file (`.mp4/.avi/.mov/.mkv/.webm`). Point `data.train.params.dir_paths`
+(and `data.val.params.lq_path/gt_path`) in `configs/vsr_DiT.yaml` to your folders. Training clips of `num_frames` frames are
+sampled with a random temporal stride; crop/flip are shared by all frames and the Real-ESRGAN degradation uses one set of
+blur kernels and one JPEG quality per clip (noise is independent per frame).
+
+**Train.**
+```
+torchrun --nproc_per_node=<gpus> main.py --cfg_path configs/vsr_DiT.yaml --save_dir <dir>
+```
+
+**Inference.** Long videos are processed with sliding temporal windows (`--num_frames`, `--frame_overlap`) and
+overlapping spatial tiles (`--chop_size`, `--chop_stride`, in LQ pixels, multiples of 64); overlaps are blended and every
+frame always starts from the same noise, which keeps windows/tiles consistent.
+```
+python inference_video.py -i input.mp4 -o results --ckpt_path <dir>/ckpts/model_xxx.pth --config_path configs/vsr_DiT.yaml
+```

@@ -17,10 +17,12 @@ or relying on this code beyond research use. The original README is kept unchang
   `[B, C, H, W]`. Frames are folded into the batch for all per-frame layers; each Swin block gains a
   temporal self-attention branch (across T at every spatial location, sinusoidal frame-index embedding, adaLN-Zero
   gated) so any T works. At init the temporal branch is off, so a video behaves like per-frame image SR.
-  `temporal_attn: False` in the model params disables it. Not yet done: video dataloader, degradation pipeline
-  and trainer/inference scripts are still image-only.
+  `temporal_attn: False` in the model params disables it.
 - Pixel space: the VQ autoencoder is removed (configs, trainers, sampler, `ldm` VAE code, `first_stage_model` plumbing).
   Diffusion runs on RGB directly (`latent_flag: False`). To keep the compute of the old f4/f8 latent UNet,
   `DiTSRModel` takes `patch_size` (4 for realsr, 8 for faceir): pixels are pixel-unshuffled into channels before
   the UNet (`image_size = H / patch_size`) and shuffled back after. The LQ condition is bicubic-resized to x's
   grid inside the model. Pretrained upstream weights are not compatible.
+- Video pipeline: `datapipe/video_datasets.py` (clip datasets), `trainer_video.py` (`TrainerDifVSR`, config
+  `configs/vsr_DiT.yaml`), `sampler_video.py` / `inference_video.py` (windowed + tiled inference). The image
+  trainer's Real-ESRGAN degradation was factored into `TrainerDifIR._degrade` (behaviour unchanged) so both share it.

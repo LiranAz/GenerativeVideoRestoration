@@ -131,6 +131,12 @@ def create_dataset(dataset_config):
         dataset = BSRGANLightDegImageNet(**dataset_config['params'])
     elif dataset_config['type'] == 'realesrgan':
         dataset = RealESRGANDataset(dataset_config['params'])
+    elif dataset_config['type'] == 'video_realesrgan':
+        from .video_datasets import VideoRealESRGANDataset
+        dataset = VideoRealESRGANDataset(dataset_config['params'])
+    elif dataset_config['type'] == 'video_paired':
+        from .video_datasets import VideoPairedData
+        dataset = VideoPairedData(**dataset_config['params'])
     elif dataset_config['type'] == 'siddval':
         dataset = SIDDValData(**dataset_config['params'])
     elif dataset_config['type'] == 'inpainting':
