@@ -1,0 +1,12 @@
+# Scenario 7 - INFERENCE with WeatherDiff-style patch aggregation (see patch_restoration.py): the whole clip is
+# restored in one reverse process, the model outputs of overlapping space-time patches are averaged at every step.
+# Model/crop settings must match the checkpoint you load (here: the default configs/vsr_DiT.yaml).
+_base_: configs/vsr_DiT.yaml
+
+patch_restoration:
+  enabled: True
+  patch_stride: 128      # patch_size // 2 -> 4x cost; use 192 (about 1.8x) for a faster, slightly less smooth result
+  patch_frames: 5        # match data.train.params.num_frames
+  frame_stride: 3
+  weighting: tent        # down-weights the borders of every patch (uniform = WeatherDiff default)
+  batch_size: 4

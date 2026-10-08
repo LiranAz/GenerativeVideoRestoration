@@ -2,6 +2,7 @@ import argparse
 from omegaconf import OmegaConf
 
 from utils.util_common import get_obj_from_str
+from utils.util_config import load_config
 from utils.util_opts import str2bool
 
 def get_parser(**parser_kwargs):
@@ -26,6 +27,13 @@ def get_parser(**parser_kwargs):
             default="./configs/training/ffhq256_bicubic8.yaml",
             help="Configs of yaml file",
             )
+    parser.add_argument(
+            "--set",
+            nargs="*",
+            default=[],
+            metavar="KEY=VALUE",
+            help="Config overrides, e.g. --set train.iterations=100 'data.train.params.dir_paths=[/data/videos]'",
+            )
     args = parser.parse_args()
 
     return args
@@ -33,7 +41,7 @@ def get_parser(**parser_kwargs):
 if __name__ == "__main__":
     args = get_parser()
 
-    configs = OmegaConf.load(args.cfg_path)
+    configs = load_config(args.cfg_path, args.set)    # supports `_base_:` inheritance and --set overrides
 
     # merge args to config
     for key in vars(args):

@@ -3,6 +3,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from sampler_video import VideoSampler
+from utils.util_config import load_config
 from utils.util_crop import resolve_crop, lq_multiple
 from utils.util_opts import str2bool
 
@@ -16,19 +17,20 @@ def get_parser():
     parser.add_argument("--scale", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=None, help="Frames per window (default: training clip length).")
     parser.add_argument("--frame_overlap", type=int, default=2, help="Frames shared by consecutive windows.")
-    parser.add_argument("--chop_size", type=int, default=128, help="Spatial tile size in LQ pixels (multiple of 64).")
+    parser.add_argument("--chop_size", type=int, default=128, help="Spatial tile size in LQ pixels (multiple of the model LQ unit: 64 at 4x, 128 at 2x).")
     parser.add_argument("--chop_stride", type=int, default=96, help="Spatial tile stride in LQ pixels.")
     parser.add_argument("--patch_restoration", type=str2bool, const=True, default=None, nargs="?",
                         help="Override `patch_restoration.enabled` of the config (WeatherDiff-style patch aggregation).")
     parser.add_argument("--save_frames", type=str2bool, const=True, default=False, nargs="?", help="Also write PNG frames.")
     parser.add_argument("--fp32", type=str2bool, const=True, default=False, nargs="?", help="disable amp")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="Config overrides (OmegaConf dotlist).")
     parser.add_argument("--seed", type=int, default=12345)
     return parser.parse_args()
 
 
 def main():
     args = get_parser()
-    configs = OmegaConf.load(args.config_path)
+    configs = load_config(args.config_path, args.set)
     resolve_crop(configs)       # same crop-dependent values as in training (model image_size, patch size)
     configs.model.ckpt_path = str(args.ckpt_path)
     configs.diffusion.params.sf = args.scale

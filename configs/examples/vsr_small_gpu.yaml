@@ -1,0 +1,27 @@
+# Scenario 3 - SMALL GPU (about 12-16 GB): 128 px crops, 3-frame clips, narrower model, gradient accumulation.
+# The crop is changed in ONE place (degradation.gt_size); image_size, the dataset crop and the patch size follow.
+# At 128 px the folded UNet runs at 32/16/8/4, so attention_resolutions is adapted accordingly.
+_base_: configs/vsr_DiT.yaml
+
+model:
+  params:
+    model_channels: 96
+    swin_embed_dim: 96
+    swin_depth: 2
+    attention_resolutions: [32, 16, 8]
+
+degradation:
+  gt_size: 128
+  queue_size: 32
+
+data:
+  train:
+    params:
+      num_frames: 3
+  val:
+    params:
+      num_frames: 3
+
+train:
+  batch: [16, 1]     # per step, over all GPUs
+  microbatch: 2      # per forward/backward; batch / microbatch = gradient accumulation steps

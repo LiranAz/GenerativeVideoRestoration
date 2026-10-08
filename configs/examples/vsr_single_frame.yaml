@@ -1,0 +1,18 @@
+# Scenario 4 - SINGLE FRAMES (image-style training from videos or frame folders): clips of one frame.
+# The temporal layers still run for T=1 (attention over one frame), so the same checkpoint can later be applied
+# to clips. Use clips (vsr_DiT.yaml) afterwards, or fine-tune from this checkpoint via model.ckpt_path.
+_base_: configs/vsr_DiT.yaml
+
+data:
+  train:
+    params:
+      num_frames: 1
+      frame_stride: [1, 1]
+      reverse_prob: 0.0
+  val:
+    params:
+      num_frames: 1
+
+train:
+  batch: [32, 1]
+  microbatch: 8

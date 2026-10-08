@@ -1,0 +1,29 @@
+# Scenario 1 - SMOKE TEST: tiny model, a few iterations. Verifies data paths, degradation, training, validation,
+# checkpoints and inference end to end in minutes (even on CPU-like conditions). Not for real results.
+_base_: configs/vsr_DiT.yaml
+
+model:
+  params:
+    model_channels: 32
+    swin_embed_dim: 64
+    swin_depth: 1
+    num_head_channels: 32
+
+diffusion:
+  params:
+    steps: 3
+
+degradation:
+  queue_size: 2
+
+train:
+  iterations: 20
+  save_freq: 10
+  val_freq: 10
+  log_freq: [5, 10, 1]
+  warmup_iterations: 5
+  batch: [2, 1]
+  microbatch: 1
+  num_workers: 2
+  ema_rate: 0.9
+  use_amp: False

@@ -1,0 +1,10 @@
+# Scenario 5 - 2x UPSCALING instead of 4x. The LQ clip is half the HR size; the model is unchanged because the LQ
+# condition is resized to the HR grid inside the network. The sampler/validation LQ multiple becomes 128 pixels.
+_base_: configs/vsr_DiT.yaml
+
+degradation:
+  sf: 2
+
+diffusion:
+  params:
+    sf: 2

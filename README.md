@@ -90,6 +90,100 @@ Training clips are cropped to `gt_size` and flipped identically for all frames. 
 the GPU with **one set of blur kernels and one JPEG quality per clip**; resize factors and noise type are shared by the
 batch, and noise is sampled independently for every frame.
 
+### Example configs and run instructions
+All example configs live in `configs/examples/` and only list what differs from `configs/vsr_DiT.yaml` (they start with
+`_base_: configs/vsr_DiT.yaml`; lists are replaced, other keys are merged). Any config value can be overridden on the
+command line with `--set key=value ...` (both `main.py` and `inference_video.py`), so you never have to edit a file
+just to point at your data. Replace `<...>` placeholders; use `torchrun --standalone --nproc_per_node=<gpus> --nnodes=1`
+instead of `python` for multi-GPU training.
+
+| # | Scenario | Config | Use it for |
+|---|---|---|---|
+| 1 | Smoke test | `configs/examples/vsr_smoke_test.yaml` | check data, training, validation, checkpoints in minutes (tiny model, 20 iterations) |
+| 2 | Standard video SR, 4x | `configs/vsr_DiT.yaml` | real training: 256 px crops, 5-frame clips, 56M parameters |
+| 3 | Small GPU | `configs/examples/vsr_small_gpu.yaml` | 128 px crops, 3-frame clips, 20M parameters, gradient accumulation |
+| 4 | Single frames | `configs/examples/vsr_single_frame.yaml` | image-style training from videos / frame folders (`T=1`) |
+| 5 | 2x upscaling | `configs/examples/vsr_x2.yaml` | `sf=2` instead of `sf=4` |
+| 6 | Resume / fine-tune | any of the above | continue a run, or start from a checkpoint |
+| 7 | Inference | `configs/vsr_DiT.yaml` or `configs/examples/vsr_patch_inference.yaml` | restore videos, tiled or WeatherDiff-style patch aggregation |
+| 8 | Evaluation | – | PSNR / SSIM / LPIPS / temporal difference error |
+
+The data arguments used below (`dir_paths`, `lq_path`, `gt_path`) are searched recursively; a video is a folder of frames or
+a video file. The validation set needs `lq_path`; `gt_path` is optional (`--set data.val.params.gt_path=null`: validation then only
+writes restored images and skips PSNR/LPIPS).
+
+**1. Smoke test** (tiny model, `use_amp: False`, so it also runs on small or older GPUs)
+```
+python main.py --cfg_path configs/examples/vsr_smoke_test.yaml --save_dir runs/smoke \
+  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+```
+Expect `Train: ...`, `Validation Metric ...` lines and `runs/smoke/<timestamp>/{ckpts,ema_ckpts,images}`.
+
+**2. Standard video SR (4x)**
+```
+torchrun --standalone --nproc_per_node=<gpus> --nnodes=1 main.py --cfg_path configs/vsr_DiT.yaml --save_dir runs/vsr \
+  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+```
+Defaults: `batch: [16, 1]`, `microbatch: 2`, 300k iterations, mixed precision. Reduce `microbatch` if you run out of memory
+(`batch / microbatch` = gradient accumulation steps).
+
+**3. Small GPU (about 12-16 GB)**
+```
+python main.py --cfg_path configs/examples/vsr_small_gpu.yaml --save_dir runs/small \
+  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+```
+The crop is changed in one place (`degradation.gt_size: 128`); the UNet resolution, dataset crop and patch size follow
+(see *Crop size* above). `attention_resolutions` is adapted in the config because the folded UNet levels are 32/16/8/4.
+Inference with a checkpoint from this config needs the same `--config_path` (the crop is part of the architecture).
+
+**4. Single frames (`T=1`)**
+```
+python main.py --cfg_path configs/examples/vsr_single_frame.yaml --save_dir runs/single \
+  --set "data.train.params.dir_paths=[<train_videos_or_frame_folders>]" data.val.params.lq_path=<val_lq> data.val.params.gt_path=<val_gt>
+```
+The temporal layers still run (attention over one frame) so the checkpoint can later be used on clips or fine-tuned with
+scenario 2 via `model.ckpt_path`.
+
+**5. 2x upscaling**
+```
+python main.py --cfg_path configs/examples/vsr_x2.yaml --save_dir runs/x2 \
+  --set "data.train.params.dir_paths=[<train_videos>]" data.val.params.lq_path=<val_lq_x2> data.val.params.gt_path=<val_gt>
+python inference_video.py -i <lq_x2_video> -o results_x2 --config_path configs/examples/vsr_x2.yaml \
+  --ckpt_path runs/x2/<timestamp>/ckpts/model_<iter>.pth --scale 2 --chop_size 128 --chop_stride 96
+```
+At 2x the LQ multiple is 128 pixels, so `--chop_size` must be a multiple of 128 (64 at 4x) and validation LQ clips are cropped
+to multiples of 128.
+
+**6. Resume or fine-tune**
+```
+# continue the same run (restores model, EMA, learning rate schedule and log counters; keep the same config)
+python main.py --cfg_path configs/vsr_DiT.yaml --resume runs/vsr/<timestamp>/ckpts/model_<iter>.pth
+# start a NEW run from existing weights (e.g. single-frame -> clips)
+python main.py --cfg_path configs/vsr_DiT.yaml --save_dir runs/finetune \
+  --set model.ckpt_path=runs/single/<timestamp>/ckpts/model_<iter>.pth "data.train.params.dir_paths=[<train_videos>]"
+```
+`--resume` takes the checkpoint path and finds `ema_ckpts/ema_<name>.pth` next to it.
+
+**7. Inference**
+```
+# tiled (default): temporal windows x spatial tiles, blended
+python inference_video.py -i <video_or_frames_or_folder> -o results --config_path configs/vsr_DiT.yaml \
+  --ckpt_path runs/vsr/<timestamp>/ema_ckpts/ema_model_<iter>.pth
+# WeatherDiff-style patch aggregation (smoother, ~4x more compute; any size >= one patch)
+python inference_video.py -i <video_or_frames_or_folder> -o results_patch --config_path configs/examples/vsr_patch_inference.yaml \
+  --ckpt_path runs/vsr/<timestamp>/ema_ckpts/ema_model_<iter>.pth
+# same thing without a separate config
+python inference_video.py -i <...> -o results_patch --config_path configs/vsr_DiT.yaml --ckpt_path <...> --patch_restoration true
+```
+Use the EMA weights (`ema_ckpts/ema_model_<iter>.pth`) for best results; plain checkpoints are `ckpts/model_<iter>.pth`.
+Memory knobs: `--chop_size/--chop_stride` (tiled mode), `--num_frames/--frame_overlap` (both modes),
+`patch_restoration.batch_size` / `patch_stride` (patch mode). Add `--fp32` to disable mixed precision.
+
+**8. Evaluation** (restored videos against ground truth, paired by name)
+```
+python evaluate_video.py -i results -r <gt_videos> --metrics psnr,ssim,tde --out_json metrics.json
+```
+
 ### Train
 ```
 torchrun --standalone --nproc_per_node=<gpus> --nnodes=1 main.py --cfg_path configs/vsr_DiT.yaml --save_dir ${save_dir}
@@ -106,7 +200,7 @@ python inference_video.py -i input.mp4 -o results --ckpt_path ${save_dir}/ckpts/
 frames; frame folders are always written as PNGs).
 
 Long videos are handled with sliding temporal windows (`--num_frames`, `--frame_overlap`) and overlapping spatial tiles
-(`--chop_size`, `--chop_stride`, in LQ pixels; `chop_size` must be a multiple of 64). Overlaps are blended with smooth
+(`--chop_size`, `--chop_stride`, in LQ pixels; `chop_size` must be a multiple of the LQ unit: 64 at 4x, 128 at 2x). Overlaps are blended with smooth
 weights, and the initial noise of every frame depends only on the seed, the frame index and the pixel position, so
 overlapping windows and tiles start from identical noise and agree with each other.
 
